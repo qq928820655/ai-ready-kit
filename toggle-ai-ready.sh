@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # toggle-ai-ready.sh — .ai-ready 规则一键替换 / 一键还原
-# version: 20261029.6
+# version: 20261029.7
 #
 # 托管：仓库里放两个文件（脚本 + 载荷包），服务器上一条命令安装:
 #   curl -fsSL <URL_BASE>/toggle-ai-ready.sh | sh
@@ -13,7 +13,7 @@
 # 环境变量:
 #   AIREADY_URL_BASE   仓库原始文件地址（默认见下），脚本与载荷都从这里下载
 #   AIREADY_KIT_DIR    安装目录，默认 /workspace/.ai-ready-kit
-#   SEARCH_ROOT        目标探测根目录，默认 /workspace
+#   SEARCH_ROOT        目标探测根目录；不设时依次扫 /workspace 与 /root
 
 # ---------- POSIX 引导：服务器上 sh 通常是 dash，不认 bash 语法 ----------
 # `curl ... | sh` 时由这段接管：把本脚本下载成临时文件，交给 bash 执行。
@@ -46,12 +46,12 @@ KIT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || echo .)
 case "${BASH_SOURCE[0]:-}" in /tmp/aiready-toggle*) trap 'rm -f "${BASH_SOURCE[0]}"' EXIT ;; esac
 NEW_DIR="$KIT_DIR/new"
 BACKUP_ROOT="$KIT_DIR/backups"
-SEARCH_ROOT="${SEARCH_ROOT:-/workspace}"
+SEARCH_ROOT="${SEARCH_ROOT:-}"   # 空=按内置根列表扫（/workspace、/root）
 MARKER_DIR="$BACKUP_ROOT/.markers"
 URL_BASE="${AIREADY_URL_BASE:-https://raw.githubusercontent.com/qq928820655/ai-ready-kit/main}"
 SCRIPT_NAME="toggle-ai-ready.sh"
 PAYLOAD_NAME="ai-ready-payload.tar.gz"
-VERSION="20261029.6"
+VERSION="20261029.7"
 
 C_G='\033[32m'; C_Y='\033[33m'; C_R='\033[31m'; C_B='\033[36m'; C_0='\033[0m'
 say()  { printf "%b%s%b\n" "$C_B" "$*" "$C_0"; }
@@ -99,7 +99,7 @@ do_install() {
         for t in "${ts[@]}"; do printf '  %d) %s\n' "$i" "$t"; i=$((i+1)); done
         say "替换示例: bash $kit/$SCRIPT_NAME replace ${ts[0]}"
     else
-        warn "在 $SEARCH_ROOT 下暂未探测到 .ai-ready 目标"
+        warn "在 ${SEARCH_ROOT:-/workspace 与 /root} 下暂未探测到 .ai-ready 目标（可直接传路径：replace <项目目录>）"
     fi
 }
 
@@ -115,12 +115,15 @@ normalize_target() {
 }
 
 discover_targets() {
-    [ -d "$SEARCH_ROOT" ] || return 0
-    find "$SEARCH_ROOT" -maxdepth 6 -type d -name .ai-ready \
-        -not -path '*/node_modules/*' -not -path '*/.git/*' 2>/dev/null |
-    while read -r d; do
+    local r roots
+    roots="${SEARCH_ROOT:-/workspace /root}"
+    for r in $roots; do
+        [ -d "$r" ] || continue
+        find "$r" -maxdepth 6 -type d -name .ai-ready \
+            -not -path '*/node_modules/*' -not -path '*/.git/*' 2>/dev/null
+    done | while read -r d; do
         if [ -d "$d/rules" ] || [ -d "$d/skills" ]; then printf '%s\n' "$d"; fi
-    done
+    done | awk '!seen[$0]++'
 }
 
 slug() { printf '%s' "$1" | sed 's#^/##; s#/#_#g; s#[^A-Za-z0-9_.-]#_#g'; }
@@ -219,7 +222,7 @@ pick_target() {  # 提示走 stderr，仅最终路径走 stdout
     local targets=()
     mapfile -t targets < <(discover_targets)
     if [ "${#targets[@]}" -eq 0 ]; then
-        warn "在 $SEARCH_ROOT 下没探测到 .ai-ready（需含 rules/ 或 skills/）"
+        warn "在 ${SEARCH_ROOT:-/workspace 与 /root} 下没探测到 .ai-ready（需含 rules/ 或 skills/）"
         printf '输入 .ai-ready 或其项目目录路径: ' >&2
         local p; read -r p
         [ -n "$p" ] || return 1

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # toggle-ai-ready.sh — .ai-ready 规则一键替换 / 一键还原
-# version: 2026103005
+# version: 2026103006
 #
 # 托管：仓库里放两个文件（脚本 + 载荷包），服务器上一条命令安装:
 #   curl -fsSL <URL_BASE>/toggle-ai-ready.sh | sh              # 安装 → 进菜单
@@ -74,7 +74,7 @@ URL_BASE="${AIREADY_URL_BASE:-$DEFAULT_BASE}"
 BASE_CACHE="$KIT_DIR/.base"
 SCRIPT_NAME="toggle-ai-ready.sh"
 PAYLOAD_NAME="ai-ready-payload.tar.gz"
-VERSION="2026103005"
+VERSION="2026103006"
 UPDATE_TTL="${AIREADY_UPDATE_TTL:-600}"
 
 C_G='\033[32m'; C_Y='\033[33m'; C_R='\033[31m'; C_B='\033[36m'; C_0='\033[0m'
@@ -271,9 +271,9 @@ do_repair() {
 
 do_uninstall() {
     local yn
-    printf '%b卸载只删除 %s 下的 kit 组件，目标项目的 .ai-ready 不受影响。确认?[y/N]: %b' "$C_Y" "$KIT_DIR" "$C_0"
+    printf '%b卸载只删除 %s 下的 kit 组件，目标项目的 .ai-ready 不受影响。确认?[Y/n，输入 n 取消]: %b' "$C_Y" "$KIT_DIR" "$C_0"
     read -r yn || yn=""
-    case "$yn" in y|Y) ;; *) say "已取消"; return 0 ;; esac
+    case "$yn" in n|N) say "已取消"; return 0 ;; esac
     if [ -L /usr/local/bin/ai-ready ]; then rm -f /usr/local/bin/ai-ready; fi
     rm -rf "$NEW_DIR" "$BACKUP_ROOT" "$STATE_FILE" "$CHECK_CACHE" "$BASE_CACHE" \
            "$KIT_DIR/.toggle.tmp" "$KIT_DIR/.payload.tmp"
@@ -487,8 +487,9 @@ pick_target() {  # 提示走 stderr，仅最终路径走 stdout
     local i=1 t
     for t in "${TARGETS[@]}"; do printf '  %d) %s\n' "$i" "$t" >&2; i=$((i+1)); done
     printf '  m) 手动输入路径\n' >&2
-    printf '选择 [1-%d/m]: ' "${#TARGETS[@]}" >&2
+    printf '选择 [1-%d/m，回车=1]: ' "${#TARGETS[@]}" >&2
     local c; read -r c || return 1
+    c="${c:-1}"          # 回车 = 第一个目标
     case "$c" in
         m|M)
             printf '路径: ' >&2; local p; read -r p || return 1
@@ -571,9 +572,9 @@ do_overview() {
     [ "$c" -ge 1 ] && [ "$c" -le "${#TARGETS[@]}" ] || return 0
     t="${TARGETS[$((c-1))]}"
     do_status "$t"
-    printf '看逐文件差异? [y/N]: '
+    printf '看逐文件差异? [Y/n]: '
     local yn; read -r yn || return 0
-    case "$yn" in y|Y) do_diff "$t" ;; esac
+    case "$yn" in n|N) ;; *) do_diff "$t" ;; esac
 }
 
 # 版本与更新：先显示状态，远端有新版就问一句
@@ -584,17 +585,17 @@ do_version_menu() {
     check_update || st=$?
     case "$st" in
         0)
-            printf '%b远端 v%s（本地 v%s），现在更新? [y/N]: %b' "$C_Y" "$RV" "$IV" "$C_0"
+            printf '%b远端 v%s（本地 v%s），现在更新? [Y/n]: %b' "$C_Y" "$RV" "$IV" "$C_0"
             read -r yn || yn=""
             case "$yn" in
-                y|Y)
+                n|N) say "已跳过" ;;
+                *)
                     do_install
                     # 更新后 exec 新脚本，让新版本功能立即生效
                     ensure_interactive || return 0
                     export AIREADY_SKIP_UPDATE=1
                     unset AIREADY_PIPED
                     exec bash "$KIT_DIR/$SCRIPT_NAME" menu ;;
-                *) say "已跳过" ;;
             esac ;;
         1) ok "已是最新 v$IV" ;;
         *) warn "连不上远端，无法检查（$URL_BASE）" ;;
@@ -610,8 +611,9 @@ do_maintenance() {
         printf '  2) 强制重装（脚本 + 载荷）\n'
         printf '  3) 卸载\n'
         printf '  0) 返回\n'
-        printf '选择: '
+        printf '选择 [1-3，回车=1]: '
         read -r op || return 0
+        op="${op:-1}"
         case "$op" in
             0) return 0 ;;
             1) do_repair ;;
@@ -637,8 +639,9 @@ menu() {
         printf '  4) 版本与更新   版本信息，有新版时询问\n'
         printf '  5) 维护         修复 / 重装 / 卸载\n'
         printf '  0) 退出\n'
-        printf '选择: '
+        printf '选择 [回车=1，0=退出]: '
         read -r op || { echo; say "输入结束，退出"; return 0; }
+        op="${op:-1}"        # 回车 = 目标与状态
         case "$op" in
             0) return 0 ;;
             1) do_overview ;;
@@ -646,11 +649,11 @@ menu() {
                 t="$(pick_target)" || { warn "未选定目标"; continue; }
                 scope="$(pick_scope)" || { warn "未选定范围"; continue; }
                 [ -d "$NEW_DIR/rules" ] || { warn "new/ 不存在，先到「维护 → 修复」"; continue; }
-                printf '%b替换 %s（范围: %s）?[y/N]: %b' "$C_Y" "$t" "$scope" "$C_0"
+                printf '%b替换 %s（范围: %s）?[Y/n]: %b' "$C_Y" "$t" "$scope" "$C_0"
                 read -r yn || yn=""
                 case "$yn" in
-                    y|Y) do_replace "$t" "$scope" ;;
-                    *)   say "已取消" ;;
+                    n|N) say "已取消" ;;
+                    *)   do_replace "$t" "$scope" ;;
                 esac ;;
             3)
                 t="$(pick_target)" || { warn "未选定目标"; continue; }

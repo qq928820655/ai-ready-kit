@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # toggle-ai-ready.sh — .ai-ready 规则一键替换 / 一键还原
-# version: 20261029.9
+# version: 2026103001
 #
 # 托管：仓库里放两个文件（脚本 + 载荷包），服务器上一条命令安装:
 #   curl -fsSL <URL_BASE>/toggle-ai-ready.sh | sh              # 安装 → 进菜单
@@ -74,7 +74,7 @@ URL_BASE="${AIREADY_URL_BASE:-$DEFAULT_BASE}"
 BASE_CACHE="$KIT_DIR/.base"
 SCRIPT_NAME="toggle-ai-ready.sh"
 PAYLOAD_NAME="ai-ready-payload.tar.gz"
-VERSION="20261029.9"
+VERSION="2026103001"
 UPDATE_TTL="${AIREADY_UPDATE_TTL:-600}"
 
 C_G='\033[32m'; C_Y='\033[33m'; C_R='\033[31m'; C_B='\033[36m'; C_0='\033[0m'
@@ -402,7 +402,7 @@ do_backups() {
     done
 }
 
-do_info() {
+do_info() {  # $1=no-check 时跳过版本检查行，由调用方自行查
     local ntg st=0
     say "KIT 目录 : $KIT_DIR"
     say "脚本版本 : v$VERSION"
@@ -415,10 +415,11 @@ do_info() {
     say "远端地址 : $URL_BASE"
     ntg="$(discover_targets | wc -l | tr -d ' ')"
     say "探测目标 : $ntg 个（${SEARCH_ROOT:-/workspace 与 /root}）"
+    [ "${1:-}" = "no-check" ] && return 0
     if [ -z "${AIREADY_SKIP_UPDATE:-}" ]; then
         check_update || st=$?
         case "$st" in
-            0) warn "版本检查 : 远端有新版 v$RV（本地 v$IV）→ 选 3 更新" ;;
+            0) warn "版本检查 : 远端有新版 v$RV（本地 v$IV）→ 选 4 更新" ;;
             1) ok   "版本检查 : 已是最新 v$IV" ;;
             *) warn "版本检查 : 连不上远端（$URL_BASE），沿用本地 v$IV" ;;
         esac
@@ -461,87 +462,163 @@ pick_target() {  # 提示走 stderr，仅最终路径走 stdout
     esac
 }
 
-pick_backup() {  # 列备份并让用户选一个时间戳，走 stdout
-    local t="$1" bdir d i=1 arr=()
+pick_backup() {  # 列备份；输出空串 = 用还原点指向的那次（最近一次）
+    local t="$1" bdir d i=2 arr=() cur=""
     bdir="$BACKUP_ROOT/$(slug "$t")"
-    [ -d "$bdir" ] || { warn "该目标暂无备份" >&2; return 1; }
-    mapfile -t arr < <(ls -1 "$bdir" 2>/dev/null | sort)
+    mapfile -t arr < <(ls -1 "$bdir" 2>/dev/null | sort -r)
     [ "${#arr[@]}" -gt 0 ] || { warn "该目标暂无备份" >&2; return 1; }
+    [ -f "$(marker_file "$t")" ] && cur="$(cat "$(marker_file "$t")")"
     echo >&2
-    for d in "${arr[@]}"; do printf '  %d) %s\n' "$i" "$d" >&2; i=$((i+1)); done
-    printf '选择备份 [1-%d]: ' "${#arr[@]}" >&2
-    local c; read -r c || return 1
-    case "$c" in ''|*[!0-9]*) return 1 ;; esac
-    [ "$c" -ge 1 ] && [ "$c" -le "${#arr[@]}" ] || return 1
-    printf '%s' "${arr[$((c-1))]}"
+    if [ -n "$cur" ]; then
+        printf '  1) 最近一次（%s）\n' "$(basename "$cur")" >&2
+    else
+        printf '  1) 最近一次\n' >&2
+    fi
+    for d in "${arr[@]}"; do
+        if [ "$bdir/$d" = "$cur" ]; then printf '  %d) %s  ← 还原点\n' "$i" "$d" >&2
+        else printf '  %d) %s\n' "$i" "$d" >&2; fi
+        i=$((i+1))
+    done
+    printf '选择 [1-%d，回车=最近一次]: ' "$((i-1))" >&2
+    local c; read -r c || c=""
+    [ -z "$c" ] && return 0
+    case "$c" in *[!0-9]*) return 1 ;; esac
+    [ "$c" -ge 1 ] && [ "$c" -le "$((i-1))" ] || return 1
+    [ "$c" -eq 1 ] && return 0
+    printf '%s' "${arr[$((c-2))]}"
+}
+
+pick_scope() {  # 替换范围，走 stdout
+    echo >&2
+    printf '  1) 全部（rules + skills）\n  2) 仅 rules\n  3) 仅 skills\n' >&2
+    printf '范围 [1-3，回车=1]: ' >&2
+    local c; read -r c || c=""
+    case "$c" in ''|1) printf 'all' ;; 2) printf 'rules' ;; 3) printf 'skills' ;; *) return 1 ;; esac
+}
+
+# 一览：每个目标一行摘要，输入编号再看详情与差异
+do_overview() {
+    local t i=1 f rel same diff miss total
+    local -a files=()
+    scan_targets
+    if [ "${#TARGETS[@]}" -eq 0 ]; then
+        warn "未探测到 .ai-ready 目标（${SEARCH_ROOT:-/workspace 与 /root}）"
+        return 0
+    fi
+    [ -d "$NEW_DIR" ] || { warn "new/ 不存在，先到「维护」里修复"; return 0; }
+    mapfile -t files < <(find "$NEW_DIR" -type f 2>/dev/null | sort)
+    total="${#files[@]}"
+    say "目标 ${#TARGETS[@]} 个（载荷 $total 个文件）:"
+    for t in "${TARGETS[@]}"; do
+        same=0; diff=0; miss=0
+        for f in "${files[@]}"; do
+            rel="${f#"$NEW_DIR/"}"
+            if [ ! -f "$t/$rel" ]; then miss=$((miss+1))
+            elif cmp -s "$f" "$t/$rel"; then same=$((same+1))
+            else diff=$((diff+1)); fi
+        done
+        if [ "$same" -eq "$total" ]; then
+            printf '  %d) %s\n     %b一致 %d/%d%b\n' "$i" "$t" "$C_G" "$same" "$total" "$C_0"
+        elif [ "$same" -eq 0 ] && [ "$diff" -eq 0 ]; then
+            printf '  %d) %s\n     未部署（缺 %d 个）\n' "$i" "$t" "$miss"
+        else
+            printf '  %d) %s\n     部分一致（同 %d / 异 %d / 缺 %d）\n' "$i" "$t" "$same" "$diff" "$miss"
+        fi
+        i=$((i+1))
+    done
+    printf '输入编号看详情，回车返回: '
+    local c; read -r c || return 0
+    case "$c" in ''|*[!0-9]*) return 0 ;; esac
+    [ "$c" -ge 1 ] && [ "$c" -le "${#TARGETS[@]}" ] || return 0
+    t="${TARGETS[$((c-1))]}"
+    do_status "$t"
+    printf '看逐文件差异? [y/N]: '
+    local yn; read -r yn || return 0
+    case "$yn" in y|Y) do_diff "$t" ;; esac
+}
+
+# 版本与更新：先显示状态，远端有新版就问一句
+do_version_menu() {
+    local st=0 yn
+    do_info no-check
+    echo
+    check_update || st=$?
+    case "$st" in
+        0)
+            printf '%b远端 v%s（本地 v%s），现在更新? [y/N]: %b' "$C_Y" "$RV" "$IV" "$C_0"
+            read -r yn || yn=""
+            case "$yn" in
+                y|Y)
+                    do_install
+                    # 更新后 exec 新脚本，让新版本功能立即生效
+                    ensure_interactive || return 0
+                    export AIREADY_SKIP_UPDATE=1
+                    unset AIREADY_PIPED
+                    exec bash "$KIT_DIR/$SCRIPT_NAME" menu ;;
+                *) say "已跳过" ;;
+            esac ;;
+        1) ok "已是最新 v$IV" ;;
+        *) warn "连不上远端，无法检查（$URL_BASE）" ;;
+    esac
+}
+
+do_maintenance() {
+    local op
+    while true; do
+        echo
+        say "维护"
+        printf '  1) 修复 new/（只重下载荷）\n'
+        printf '  2) 强制重装（脚本 + 载荷）\n'
+        printf '  3) 卸载\n'
+        printf '  0) 返回\n'
+        printf '选择: '
+        read -r op || return 0
+        case "$op" in
+            0) return 0 ;;
+            1) do_repair ;;
+            2) do_install ;;
+            3) do_uninstall ;;
+            *) warn "无效选择" ;;
+        esac
+    done
 }
 
 menu() {
-    local t yn op scope
+    local t yn op scope bk
     scan_targets
     while true; do
         echo
         printf '%b===== .ai-ready 工具包 v%s =====%b\n' "$C_B" "$VERSION" "$C_0"
-        printf '已装: %s    目标: %s 个\n' \
+        printf '已装 %s   目标 %s 个\n' \
             "$(if is_installed; then echo "v$(installed_version)"; else echo 未安装; fi)" "${#TARGETS[@]}"
         echo
-        printf ' %b-- 安装维护 --%b\n' "$C_Y" "$C_0"
-        printf '   1) 安装状态 / 版本信息       (info)\n'
-        printf '   2) 检查更新                 (check)\n'
-        printf '   3) 安装 / 更新到最新版       (update)\n'
-        printf '   4) 重新解包 new/（修复）      (repair)\n'
-        printf '   5) 卸载本工具包              (uninstall)\n'
-        printf ' %b-- 目标操作 --%b\n' "$C_Y" "$C_0"
-        printf '   6) 重新探测目标列表          (list)\n'
-        printf '   7) 查看目标状态              (status)\n'
-        printf '   8) 替换全部 rules + skills   (replace)\n'
-        printf '   9) 只替换 rules              (replace --rules)\n'
-        printf '  10) 只替换 skills             (replace --skills)\n'
-        printf '  11) 查看差异                  (diff)\n'
-        printf ' %b-- 备份还原 --%b\n' "$C_Y" "$C_0"
-        printf '  12) 备份列表                  (backups)\n'
-        printf '  13) 还原最近一次备份           (restore)\n'
-        printf '  14) 还原到指定备份             (restore <时间戳>)\n'
-        printf '   0) 退出\n'
+        printf '  1) 目标与状态   列目标 + 一致性，可展开差异\n'
+        printf '  2) 替换         选目标 → 全部 / 仅 rules / 仅 skills\n'
+        printf '  3) 还原         选目标 → 选备份（回车=最近一次）\n'
+        printf '  4) 版本与更新   版本信息，有新版时询问\n'
+        printf '  5) 维护         修复 / 重装 / 卸载\n'
+        printf '  0) 退出\n'
         printf '选择: '
         read -r op || { echo; say "输入结束，退出"; return 0; }
         case "$op" in
             0) return 0 ;;
-            1) do_info ;;
+            1) do_overview ;;
             2)
-                local st=0; check_update || st=$?
-                case "$st" in
-                    0) warn "发现新版本: v$IV → v$RV（选 3 更新）" ;;
-                    1) ok   "已是最新: v$IV" ;;
-                    *) warn "检查失败，连不上 $URL_BASE" ;;
+                t="$(pick_target)" || { warn "未选定目标"; continue; }
+                scope="$(pick_scope)" || { warn "未选定范围"; continue; }
+                [ -d "$NEW_DIR/rules" ] || { warn "new/ 不存在，先到「维护 → 修复」"; continue; }
+                printf '%b替换 %s（范围: %s）?[y/N]: %b' "$C_Y" "$t" "$scope" "$C_0"
+                read -r yn || yn=""
+                case "$yn" in
+                    y|Y) do_replace "$t" "$scope" ;;
+                    *)   say "已取消" ;;
                 esac ;;
             3)
-                do_install
-                # 更新后 exec 新脚本进菜单，让新版本的功能立即生效
-                ensure_interactive || return 0
-                export AIREADY_SKIP_UPDATE=1
-                unset AIREADY_PIPED
-                exec bash "$KIT_DIR/$SCRIPT_NAME" menu ;;
-            4) do_repair ;;
-            5) do_uninstall ;;
-            6) scan_targets
-               if [ "${#TARGETS[@]}" -eq 0 ]; then warn "未探测到目标"
-               else local i=1; for t in "${TARGETS[@]}"; do printf '  %d) %s\n' "$i" "$t"; i=$((i+1)); done; fi ;;
-            7|8|9|10|11|12|13|14)
                 t="$(pick_target)" || { warn "未选定目标"; continue; }
-                case "$op" in
-                    7)  do_status "$t" ;;
-                    11) do_diff "$t" ;;
-                    12) do_backups "$t" ;;
-                    8|9|10)
-                        case "$op" in 8) scope=all ;; 9) scope=rules ;; 10) scope=skills ;; esac
-                        printf '%b确认替换 %s（范围: %s）?[y/N]: %b' "$C_Y" "$t" "$scope" "$C_0"
-                        read -r yn || yn=""
-                        if [ "$yn" = "y" ] || [ "$yn" = "Y" ]; then do_replace "$t" "$scope"; else say "已取消"; fi ;;
-                    13) do_restore "$t" "" ;;
-                    14) local bk; bk="$(pick_backup "$t")" || { warn "未选定备份"; continue; }
-                        do_restore "$t" "$bk" ;;
-                esac ;;
+                bk="$(pick_backup "$t")" || { warn "未选定备份"; continue; }
+                do_restore "$t" "$bk" ;;
+            4) do_version_menu ;;
+            5) do_maintenance ;;
             *) warn "无效选择" ;;
         esac
     done
@@ -596,6 +673,9 @@ run_menu_flow() {
 usage() {
     cat <<'EOF'
 用法: ai-ready [命令] [参数]
+
+交互菜单 5 项: 目标与状态 / 替换 / 还原 / 版本与更新 / 维护
+（下面每个动作也都能直接当子命令调）
 
   menu                              交互菜单（默认）
   info                              安装状态 / 版本 / 目标数量

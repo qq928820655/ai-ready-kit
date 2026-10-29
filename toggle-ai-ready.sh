@@ -249,7 +249,7 @@ menu() {
     local t yn op
     while true; do
         echo
-        printf '%b======== .ai-ready 替换/还原 (v%s) ========\n' "$C_B" "$C_0" "$VERSION"
+        printf '%b======== .ai-ready 替换/还原 (v%s) ========%b\n' "$C_B" "$VERSION" "$C_0"
         printf '  1) 探测目标列表 (list)\n'
         printf '  2) 查看状态 (status)\n'
         printf '  3) 一键替换 (replace)\n'

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # toggle-ai-ready.sh — .ai-ready 规则一键替换 / 一键还原
-# version: 20261029.5
+# version: 20261029.6
 #
 # 托管：仓库里放两个文件（脚本 + 载荷包），服务器上一条命令安装:
 #   curl -fsSL <URL_BASE>/toggle-ai-ready.sh | sh
@@ -15,9 +15,35 @@
 #   AIREADY_KIT_DIR    安装目录，默认 /workspace/.ai-ready-kit
 #   SEARCH_ROOT        目标探测根目录，默认 /workspace
 
+# ---------- POSIX 引导：服务器上 sh 通常是 dash，不认 bash 语法 ----------
+# `curl ... | sh` 时由这段接管：把本脚本下载成临时文件，交给 bash 执行。
+# 以文件方式运行（sh toggle-ai-ready.sh ...）则直接换 bash 重入，不做二次下载。
+if [ -z "${BASH_VERSION:-}" ]; then
+    __sh_die() { printf '[错误] %s\n' "$*" >&2; exit 1; }
+    command -v bash >/dev/null 2>&1 || __sh_die "需要 bash，请先安装：apt-get install -y bash"
+    if [ -f "$0" ] && [ -r "$0" ] && head -c 64 "$0" 2>/dev/null | grep -q '#!/usr/bin/env bash'; then
+        exec bash "$0" "$@"
+    fi
+    __ub="${AIREADY_URL_BASE:-https://raw.githubusercontent.com/qq928820655/ai-ready-kit/main}"
+    command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 || __sh_die "缺少 curl/wget"
+    __tmp="$(mktemp /tmp/aiready-toggle.XXXXXX 2>/dev/null)" || __tmp="/tmp/aiready-toggle.$$"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "$__ub/toggle-ai-ready.sh" -o "$__tmp" || { rm -f "$__tmp"; __sh_die "下载失败: $__ub/toggle-ai-ready.sh"; }
+    else
+        wget -qO "$__tmp" "$__ub/toggle-ai-ready.sh" || { rm -f "$__tmp"; __sh_die "下载失败: $__ub/toggle-ai-ready.sh"; }
+    fi
+    AIREADY_PIPED=1
+    export AIREADY_PIPED
+    exec bash "$__tmp" "$@"
+fi
+
 set -euo pipefail
 
 KIT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || echo .)"
+# 经 POSIX 引导重启到 /tmp 临时文件时，BASH_SOURCE 指向 /tmp，安装目录改取环境变量
+[ -n "${AIREADY_PIPED:-}" ] && KIT_DIR="${AIREADY_KIT_DIR:-/workspace/.ai-ready-kit}"
+# 引导重启产生的临时脚本，进程退出时清掉
+case "${BASH_SOURCE[0]:-}" in /tmp/aiready-toggle*) trap 'rm -f "${BASH_SOURCE[0]}"' EXIT ;; esac
 NEW_DIR="$KIT_DIR/new"
 BACKUP_ROOT="$KIT_DIR/backups"
 SEARCH_ROOT="${SEARCH_ROOT:-/workspace}"
@@ -25,7 +51,7 @@ MARKER_DIR="$BACKUP_ROOT/.markers"
 URL_BASE="${AIREADY_URL_BASE:-https://raw.githubusercontent.com/qq928820655/ai-ready-kit/main}"
 SCRIPT_NAME="toggle-ai-ready.sh"
 PAYLOAD_NAME="ai-ready-payload.tar.gz"
-VERSION="20261029.5"
+VERSION="20261029.6"
 
 C_G='\033[32m'; C_Y='\033[33m'; C_R='\033[31m'; C_B='\033[36m'; C_0='\033[0m'
 say()  { printf "%b%s%b\n" "$C_B" "$*" "$C_0"; }
@@ -265,7 +291,8 @@ CMD="${1:-}"
 
 # curl | sh 管道执行（stdin 非终端且脚本不在磁盘上）：
 #   无参数 → 安装；带参数 → 先确保已安装，再交给 kit 里的完整脚本执行
-if [ -z "${BASH_SOURCE[0]:-}" ] && [ ! -t 0 ]; then
+# POSIX 引导重启的情况由 AIREADY_PIPED=1 标记（此时 BASH_SOURCE 指向 /tmp 临时文件）
+if [ -n "${AIREADY_PIPED:-}" ] || { [ -z "${BASH_SOURCE[0]:-}" ] && [ ! -t 0 ]; }; then
     local_kit="${AIREADY_KIT_DIR:-/workspace/.ai-ready-kit}"
     if [ -n "$CMD" ]; then
         if [ ! -x "$local_kit/$SCRIPT_NAME" ]; then
@@ -273,6 +300,9 @@ if [ -z "${BASH_SOURCE[0]:-}" ] && [ ! -t 0 ]; then
             do_install > /dev/null
             echo
         fi
+        # AIREADY_PIPED 是 export 的，不 unset 会被 exec 的 kit 脚本继承，
+        # kit 脚本再次进入本分支 exec 自己 → 无限循环
+        unset AIREADY_PIPED
         exec bash "$local_kit/$SCRIPT_NAME" "$@"
     fi
     do_install

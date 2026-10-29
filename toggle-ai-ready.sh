@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # toggle-ai-ready.sh — .ai-ready 规则一键替换 / 一键还原
-# version: 2026103006
+# version: 2026103007
 #
 # 托管：仓库里放两个文件（脚本 + 载荷包），服务器上一条命令安装:
 #   curl -fsSL <URL_BASE>/toggle-ai-ready.sh | sh              # 安装 → 进菜单
@@ -74,7 +74,7 @@ URL_BASE="${AIREADY_URL_BASE:-$DEFAULT_BASE}"
 BASE_CACHE="$KIT_DIR/.base"
 SCRIPT_NAME="toggle-ai-ready.sh"
 PAYLOAD_NAME="ai-ready-payload.tar.gz"
-VERSION="2026103006"
+VERSION="2026103007"
 UPDATE_TTL="${AIREADY_UPDATE_TTL:-600}"
 
 C_G='\033[32m'; C_Y='\033[33m'; C_R='\033[31m'; C_B='\033[36m'; C_0='\033[0m'
@@ -566,9 +566,10 @@ do_overview() {
         fi
         i=$((i+1))
     done
-    printf '输入编号看详情，回车返回: '
+    printf '输入编号看详情 [1-%d，回车=1]: ' "${#TARGETS[@]}"
     local c; read -r c || return 0
-    case "$c" in ''|*[!0-9]*) return 0 ;; esac
+    c="${c:-1}"                 # 回车 = 第一个目标
+    case "$c" in *[!0-9]*) return 0 ;; esac
     [ "$c" -ge 1 ] && [ "$c" -le "${#TARGETS[@]}" ] || return 0
     t="${TARGETS[$((c-1))]}"
     do_status "$t"
@@ -639,9 +640,9 @@ menu() {
         printf '  4) 版本与更新   版本信息，有新版时询问\n'
         printf '  5) 维护         修复 / 重装 / 卸载\n'
         printf '  0) 退出\n'
-        printf '选择 [回车=1，0=退出]: '
+        printf '选择 [1-5，0=退出，回车=取消]: '
         read -r op || { echo; say "输入结束，退出"; return 0; }
-        op="${op:-1}"        # 回车 = 目标与状态
+        [ -z "$op" ] && continue     # 主菜单回车=取消，不执行任何动作
         case "$op" in
             0) return 0 ;;
             1) do_overview ;;

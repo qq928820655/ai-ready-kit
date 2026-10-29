@@ -1,0 +1,3 @@
+toggle-ai-ready.sh text eol=lf
+*.tar.gz binary
+MANIFEST.md text eol=lf

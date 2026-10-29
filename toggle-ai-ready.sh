@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # toggle-ai-ready.sh — .ai-ready 规则一键替换 / 一键还原
-# version: 2026103004
+# version: 2026103005
 #
 # 托管：仓库里放两个文件（脚本 + 载荷包），服务器上一条命令安装:
 #   curl -fsSL <URL_BASE>/toggle-ai-ready.sh | sh              # 安装 → 进菜单
@@ -74,7 +74,7 @@ URL_BASE="${AIREADY_URL_BASE:-$DEFAULT_BASE}"
 BASE_CACHE="$KIT_DIR/.base"
 SCRIPT_NAME="toggle-ai-ready.sh"
 PAYLOAD_NAME="ai-ready-payload.tar.gz"
-VERSION="2026103004"
+VERSION="2026103005"
 UPDATE_TTL="${AIREADY_UPDATE_TTL:-600}"
 
 C_G='\033[32m'; C_Y='\033[33m'; C_R='\033[31m'; C_B='\033[36m'; C_0='\033[0m'
@@ -89,8 +89,16 @@ IV=""; RV=""
 
 # ---------- 版本与安装状态 ----------
 
-installed_version() { sed -n 's/^VERSION=//p' "$STATE_FILE" 2>/dev/null | head -1; }
-installed_at()      { sed -n 's/^INSTALLED_AT=//p' "$STATE_FILE" 2>/dev/null | head -1; }
+# 未安装时返回空串且退出码 0：这些函数在 set -e 下被 $( ) 调用，
+# 若返回非零会让调用方整段静默退出（首次安装正是没有状态文件的情况）
+installed_version() {
+    [ -f "$STATE_FILE" ] || return 0
+    sed -n 's/^VERSION=//p' "$STATE_FILE" 2>/dev/null
+}
+installed_at() {
+    [ -f "$STATE_FILE" ] || return 0
+    sed -n 's/^INSTALLED_AT=//p' "$STATE_FILE" 2>/dev/null
+}
 
 count_new() {
     if [ -d "$NEW_DIR" ]; then find "$NEW_DIR" -type f 2>/dev/null | wc -l | tr -d ' '; else echo 0; fi

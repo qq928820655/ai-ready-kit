@@ -163,3 +163,24 @@ curl -fsSL https://raw.githubusercontent.com/qq928820655/ai-ready-kit/main/toggl
 | `AIREADY_UPDATE_TTL` | `600` | 版本检查缓存秒数 |
 | `AIREADY_NO_TTY` | 空 | 非空则按无终端处理，不进菜单（cron/CI） |
 | `SEARCH_ROOT` | `/workspace /root` | 目标探测根目录 |
+
+---
+
+## 七、下载源与缓存
+
+脚本按 raw → jsDelivr → ghproxy 顺序探测，第一个成功的写进 `.base`，之后优先用它。
+
+| 源 | 更新延迟 | 备注 |
+|---|---|---|
+| `raw.githubusercontent.com` | 约 5 分钟 | 主通道 |
+| `cdn.jsdelivr.net/.../@main` | 最长 12 小时（分支引用缓存） | 回退通道 |
+| `ghproxy.net` | 跟随 raw | 回退通道 |
+
+刚发版、CDN 还在吐旧内容时，把 URL 里的 `@main` 换成具体 commit sha 立刻能拿到新版：
+
+```bash
+SHA=$(gh api repos/qq928820655/ai-ready-kit/commits/main --jq .sha)
+curl -fsSL "https://cdn.jsdelivr.net/gh/qq928820655/ai-ready-kit@${SHA}/toggle-ai-ready.sh" | sh
+```
+
+同一份脚本里 `AIREADY_URL_BASE` 也可以直接指到 sha 路径，载荷会跟着一起取。

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # toggle-ai-ready.sh — .ai-ready 规则一键替换 / 一键还原
-# version: 20261029.7
+# version: 20261029.8
 #
 # 托管：仓库里放两个文件（脚本 + 载荷包），服务器上一条命令安装:
 #   curl -fsSL <URL_BASE>/toggle-ai-ready.sh | sh
@@ -51,7 +51,7 @@ MARKER_DIR="$BACKUP_ROOT/.markers"
 URL_BASE="${AIREADY_URL_BASE:-https://raw.githubusercontent.com/qq928820655/ai-ready-kit/main}"
 SCRIPT_NAME="toggle-ai-ready.sh"
 PAYLOAD_NAME="ai-ready-payload.tar.gz"
-VERSION="20261029.7"
+VERSION="20261029.8"
 
 C_G='\033[32m'; C_Y='\033[33m'; C_R='\033[31m'; C_B='\033[36m'; C_0='\033[0m'
 say()  { printf "%b%s%b\n" "$C_B" "$*" "$C_0"; }
@@ -85,22 +85,33 @@ do_install() {
     rm -f "$kit/.payload.tmp"
 
     ok "已安装/更新 → $kit（version $VERSION，new/ 共 $(find "$kit/new" -type f | wc -l) 个文件）"
+
+    # 建短命令入口，省得每次敲全路径；/usr/local/bin 不可写（非 root）就退化为别名提示
+    local entry="bash $kit/$SCRIPT_NAME"
+    if [ -d /usr/local/bin ] && [ -w /usr/local/bin ] && ln -sf "$kit/$SCRIPT_NAME" /usr/local/bin/ai-ready 2>/dev/null; then
+        entry="ai-ready"
+        ok "已建立快捷命令: ai-ready → $kit/$SCRIPT_NAME"
+    else
+        say "未建快捷命令（/usr/local/bin 不可写）。可自行加别名："
+        say "  echo \"alias ai-ready='bash $kit/$SCRIPT_NAME'\" >> ~/.bashrc && source ~/.bashrc"
+    fi
     echo
     say "下一步（任选）:"
-    say "  bash $kit/$SCRIPT_NAME               # 交互菜单"
-    say "  bash $kit/$SCRIPT_NAME list          # 探测目标"
-    say "  bash $kit/$SCRIPT_NAME status <目标>  # 查看状态"
-    say "  bash $kit/$SCRIPT_NAME replace <目标> # 一键替换"
+    say "  $entry               # 交互菜单"
+    say "  $entry list          # 探测目标"
+    say "  $entry status <目标>  # 查看状态"
+    say "  $entry replace <目标> # 一键替换"
     echo
     local ts=() t i=1
     mapfile -t ts < <(discover_targets)
     if [ "${#ts[@]}" -gt 0 ]; then
         say "当前探测到的目标:"
         for t in "${ts[@]}"; do printf '  %d) %s\n' "$i" "$t"; i=$((i+1)); done
-        say "替换示例: bash $kit/$SCRIPT_NAME replace ${ts[0]}"
+        say "替换示例: $entry replace ${ts[0]}"
     else
         warn "在 ${SEARCH_ROOT:-/workspace 与 /root} 下暂未探测到 .ai-ready 目标（可直接传路径：replace <项目目录>）"
     fi
+
 }
 
 # ---------- 目标探测 ----------

@@ -184,3 +184,14 @@ curl -fsSL "https://cdn.jsdelivr.net/gh/qq928820655/ai-ready-kit@${SHA}/toggle-a
 ```
 
 同一份脚本里 `AIREADY_URL_BASE` 也可以直接指到 sha 路径，载荷会跟着一起取。
+
+### 缓存源的版本复核
+
+CDN 的分支引用有缓存，可能几小时内一直吐旧文件。脚本对此做了两道防护：
+
+1. `check` / 菜单进版本菜单时，若命中源不是主通道（`raw.githubusercontent.com`），
+   再向主通道要一次版本号，取较新者；主通道更高就同时作废 `.base` 缓存。
+2. `update` 下载完脚本后，若拿到的版本不比当前新、且来源是镜像，作废 `.base` 并强制回主通道重下一次。
+
+所以即便之前缓存到了落后的 jsDelivr 地址，也不会卡在旧版本，更不会把版本往回带。
+显式设置 `AIREADY_URL_BASE` 时不做这套复核，只走你指定的源。

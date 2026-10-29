@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # toggle-ai-ready.sh — .ai-ready 规则一键替换 / 一键还原
-# version: 2026103003
+# version: 2026103004
 #
 # 托管：仓库里放两个文件（脚本 + 载荷包），服务器上一条命令安装:
 #   curl -fsSL <URL_BASE>/toggle-ai-ready.sh | sh              # 安装 → 进菜单
@@ -74,7 +74,7 @@ URL_BASE="${AIREADY_URL_BASE:-$DEFAULT_BASE}"
 BASE_CACHE="$KIT_DIR/.base"
 SCRIPT_NAME="toggle-ai-ready.sh"
 PAYLOAD_NAME="ai-ready-payload.tar.gz"
-VERSION="2026103003"
+VERSION="2026103004"
 UPDATE_TTL="${AIREADY_UPDATE_TTL:-600}"
 
 C_G='\033[32m'; C_Y='\033[33m'; C_R='\033[31m'; C_B='\033[36m'; C_0='\033[0m'
@@ -133,6 +133,20 @@ remote_version() {
     ver="$(sed -n 's/^# version:[[:space:]]*\([^[:space:]]*\).*/\1/p' "$tmp" | head -1)"
     rm -f "$tmp"
     [ -n "$ver" ] || return 1
+
+    # 命中源不是主通道时再向主通道核对一次：jsDelivr 的 @main 分支引用最长缓存 12 小时，
+    # 只用它的版本号会漏判新版，导致永远停在旧版。主通道更高就采信它并作废源缓存，
+    # 让随后的 do_install 从主通道重新试，不会从落后源下载回旧脚本。
+    if [ -z "${AIREADY_URL_BASE:-}" ] && [ "${URL_BASE:-}" != "$DEFAULT_BASE" ]; then
+        local hv
+        hv="$(curl -fsSL --connect-timeout 5 --max-time 10 "$DEFAULT_BASE/$SCRIPT_NAME" 2>/dev/null \
+              | sed -n 's/^# version:[[:space:]]*\([^[:space:]]*\).*/\1/p' | head -1)"
+        if [ -n "${hv:-}" ] && ver_gt "$hv" "$ver"; then
+            ver="$hv"
+            rm -f "$BASE_CACHE"
+        fi
+    fi
+
     printf 'TS=%s\nVER=%s\n' "$now" "$ver" > "$CHECK_CACHE" 2>/dev/null || true
     printf '%s' "$ver"
 }
@@ -196,22 +210,39 @@ link_entry() {
 }
 
 do_install() {
-    local kit="$KIT_DIR" stmp="$KIT_DIR/.toggle.tmp" ptmp="$KIT_DIR/.payload.tmp" newv
+    local kit="$KIT_DIR" stmp="$KIT_DIR/.toggle.tmp" ptmp="$KIT_DIR/.payload.tmp" newv cur
+
+    # 下载脚本 + 载荷；被 AIREADY_URL_BASE 覆盖时只走指定源
+    dl_pair() {
+        fetch_file "$SCRIPT_NAME" "$stmp" 30 || { rm -f "$stmp"; die "下载脚本失败（已试 raw 与镜像）: $SCRIPT_NAME"; }
+        bash -n "$stmp" || { rm -f "$stmp"; die "下载的脚本语法异常，已放弃"; }
+        say "脚本与载荷来源 ← $URL_BASE"
+        fetch_file "$PAYLOAD_NAME" "$ptmp" 180 || { rm -f "$stmp" "$ptmp"; die "下载载荷失败（已试 raw 与镜像）: $PAYLOAD_NAME"; }
+    }
+    script_ver() { sed -n 's/^# version:[[:space:]]*\([^[:space:]]*\).*/\1/p' "$stmp" | head -1; }
+
     mkdir -p "$kit"
     rm -f "$stmp" "$ptmp"
-    say "拉取脚本与载荷 ← $URL_BASE"
+    dl_pair
 
-    fetch_file "$SCRIPT_NAME" "$stmp" 30 || { rm -f "$stmp"; die "下载脚本失败（已试 raw 与镜像）: $SCRIPT_NAME"; }
-    bash -n "$stmp" || { rm -f "$stmp"; die "下载的脚本语法异常，已放弃"; }
-    fetch_file "$PAYLOAD_NAME" "$ptmp" 180 || { rm -f "$stmp" "$ptmp"; die "下载载荷失败（已试 raw 与镜像）: $PAYLOAD_NAME"; }
+    # 命中的源是镜像（.base 缓存）时，下到的可能比当前还旧 —— CDN 分支引用缓存最长 12 小时。
+    # 这种情况作废源缓存、强制回主通道重下一次，避免"更新"把版本往回带。
+    newv="$(script_ver)"
+    cur="$(installed_version)"; [ -n "$cur" ] || cur="$VERSION"
+    if [ -n "${newv:-}" ] && [ -z "${AIREADY_URL_BASE:-}" ] \
+       && [ "${URL_BASE:-}" != "$DEFAULT_BASE" ] && ! ver_gt "$newv" "$cur"; then
+        say "命中的源只给到 v$newv（当前 v$cur），回主通道重取"
+        rm -f "$BASE_CACHE" "$stmp" "$ptmp"
+        AIREADY_URL_BASE="$DEFAULT_BASE" dl_pair
+        newv="$(script_ver)"
+    fi
 
     mv -f "$stmp" "$kit/$SCRIPT_NAME"
     chmod +x "$kit/$SCRIPT_NAME"
     unpack_payload "$ptmp"
 
     # 版本以落盘脚本为准：本进程可能是旧版，正在自我更新
-    newv="$(sed -n 's/^# version:[[:space:]]*\([^[:space:]]*\).*/\1/p' "$kit/$SCRIPT_NAME" | head -1)"
-    [ -n "$newv" ] || newv="$VERSION"
+    [ -n "${newv:-}" ] || newv="$VERSION"
     printf 'VERSION=%s\nINSTALLED_AT=%s\nURL_BASE=%s\n' \
         "$newv" "$(date +%Y%m%d-%H%M%S)" "$URL_BASE" > "$STATE_FILE"
     rm -f "$CHECK_CACHE"

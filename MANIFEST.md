@@ -1,6 +1,6 @@
 # 改写文件清单（部署包 new/ 内容，2026-10-29 终态）
 
-对照原始备份 `.backup-ai-ready-20261029-134217/`。共 23 个文件：12 个有改动（含新增 1 个）、11 个与原文一致。
+对照原始备份 `.backup-ai-ready-20261029-134217/`。共 22 个文件：11 个有改动、11 个与原文一致。
 
 ## 一、整篇重写（7 个）
 
@@ -22,12 +22,6 @@
 | `rules/frontend-reverse-proxy.md` | 1+1 | 首段恢复原文 `always configure...`；**start.sh 三处真实错误修复**（`BACKEND_PID=` 空赋值、`trap "kill "` 无目标、`cd` 顺序错）——双 PID + trap + wait -n，必须保留 |
 | `skills/deploy-website/SKILL.md` | 5 | 第 1、2 处恢复原文（`必须先查阅`、`重要`）；第 3-5 处保留：exec 占会话解释、pkill 误杀解释 + `pgrep -a` 路径、重复条目合并 |
 | `skills/publish-website/SKILL.md` | 24 保留 + 4 回退 | 保留：触发资格、通道预检、`Warning` 改运行时约束、`Hard Rules` 改固定序列、召回边界等；回退：267/270/562/640-643 四处产物规格 `must not`（表达字段规格更精确）；alpine、500MB、`--network host`、`--format docker-archive` 全部原样 |
-
-## 二.5、新增（1 个，v20261029.3）
-
-| 文件 | 内容 |
-|---|---|
-| `rules/server-safety-boundary.md` | 服务器安全边界：主机重启类操作（shutdown/reboot/init/systemctl poweroff）不直接执行，说明影响面后由用户确认；常驻必须进程与 opencode 进程不按名批量 kill，先 `pgrep -a` 出清单逐 PID 核对，必须进程走 systemctl 路径 |
 
 ## 三、与原文逐字节一致（11 个）
 

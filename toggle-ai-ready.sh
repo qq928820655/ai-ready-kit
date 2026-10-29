@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # toggle-ai-ready.sh — .ai-ready 规则一键替换 / 一键还原
-# version: 20261029.3
+# version: 20261029.4
 #
 # 托管：仓库里放两个文件（脚本 + 载荷包），服务器上一条命令安装:
 #   curl -fsSL <URL_BASE>/toggle-ai-ready.sh | sh
@@ -25,7 +25,7 @@ MARKER_DIR="$BACKUP_ROOT/.markers"
 URL_BASE="${AIREADY_URL_BASE:-https://raw.githubusercontent.com/qq928820655/ai-ready-kit/main}"
 SCRIPT_NAME="toggle-ai-ready.sh"
 PAYLOAD_NAME="ai-ready-payload.tar.gz"
-VERSION="20261029.3"
+VERSION="20261029.4"
 
 C_G='\033[32m'; C_Y='\033[33m'; C_R='\033[31m'; C_B='\033[36m'; C_0='\033[0m'
 say()  { printf "%b%s%b\n" "$C_B" "$*" "$C_0"; }

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # toggle-ai-ready.sh — .ai-ready 规则一键替换 / 一键还原
-# version: 2026103008
+# version: 2026103009
 #
-# 托管：仓库里放两个文件（脚本 + 载荷包），服务器上一条命令安装:
+# 托管：仓库里放脚本 + 载荷包，服务器上一条命令安装（监控随安装自动开启）:
 #   curl -fsSL <URL_BASE>/toggle-ai-ready.sh | sh              # 安装 → 进菜单
 #   curl -fsSL <URL_BASE>/toggle-ai-ready.sh | sh -s -- replace /workspace/projA
 #
@@ -74,7 +74,7 @@ URL_BASE="${AIREADY_URL_BASE:-$DEFAULT_BASE}"
 BASE_CACHE="$KIT_DIR/.base"
 SCRIPT_NAME="toggle-ai-ready.sh"
 PAYLOAD_NAME="ai-ready-payload.tar.gz"
-VERSION="2026103008"
+VERSION="2026103009"
 UPDATE_TTL="${AIREADY_UPDATE_TTL:-600}"
 
 C_G='\033[32m'; C_Y='\033[33m'; C_R='\033[31m'; C_B='\033[36m'; C_0='\033[0m'
@@ -257,6 +257,16 @@ do_install() {
 
     ok "安装/更新完成: v$newv → $kit（new/ 共 $(count_new) 个文件）"
     link_entry
+    # 监控默认开启：装完即守，不再要求用户额外执行一次。
+    # AIREADY_NO_WATCH=1 可跳过（CI / 只装不跑的场景）。
+    if [ -z "${AIREADY_NO_WATCH:-}" ]; then
+        ensure_watcher || true
+        if watch_alive; then
+            do_guard_once >/dev/null 2>&1 || true   # 载荷可能换了，重烤基准
+        else
+            do_guard_start quiet || true
+        fi
+    fi
     return 0
 }
 
@@ -267,6 +277,14 @@ do_repair() {
     fetch_file "$PAYLOAD_NAME" "$ptmp" 180 || { rm -f "$ptmp"; die "下载载荷失败（已试 raw 与镜像）"; }
     unpack_payload "$ptmp"
     ok "new/ 已重建，共 $(count_new) 个文件（脚本版本不变: v$(installed_version || echo "$VERSION")）"
+    if [ -z "${AIREADY_NO_WATCH:-}" ]; then
+        ensure_watcher >/dev/null 2>&1 || true
+        if watch_alive; then
+            do_guard_once >/dev/null 2>&1 || true
+        else
+            do_guard_start quiet || true
+        fi
+    fi
 }
 
 do_uninstall() {
@@ -275,208 +293,506 @@ do_uninstall() {
     read -r yn || yn=""
     case "$yn" in n|N) say "已取消"; return 0 ;; esac
     if [ -L /usr/local/bin/ai-ready ]; then rm -f /usr/local/bin/ai-ready; fi
+    do_guard_stop >/dev/null 2>&1 || true
     rm -rf "$NEW_DIR" "$BACKUP_ROOT" "$STATE_FILE" "$CHECK_CACHE" "$BASE_CACHE" \
+           "$KIT_DIR/bin" "$GOLD_DIR" "$WATCH_PID" "$GUARD_LOG" \
            "$KIT_DIR/.toggle.tmp" "$KIT_DIR/.payload.tmp"
     ok "已卸载组件（/usr/local/bin/ai-ready 符号链接一并移除）"
     say "彻底删除目录: rm -rf $KIT_DIR"
     exit 0
 }
 
-# ---------- 漂移守护 ----------
-# 切换模型 / 重开项目时，平台会把项目模板里的 .ai-ready 重新铺一遍，本地改动被覆盖。
-# 守护进程周期性比对目标与 new/，发现漂移就按 new/ 回写（回写前照例快照，可还原）。
+# ---------- 实时守护 ----------
+# 平台每次切模型 / 重开项目，会把 project-tpl 里的 .ai-ready 重铺一遍
+# （create .xxx.tmp.<rand> → rename），本地改写被覆盖。
+# 这里直接监听那个目录本身，发生写 / 替换 / 删除就按基准副本写回。
+#
+# 三层结构，从快到慢：
+#   1. inotify 事件（CLOSE_WRITE / MOVED_TO / CREATE / DELETE）  毫秒级
+#   2. 60ms 静默合并，同批事件只比对一次
+#   3. 每秒全量兜底比对，覆盖丢事件 / 队列溢出 / 目录被整棵换掉
+# 另加 opencode 进程启动检测：新 pid 出现立刻比对一次，堵住"重铺→重启"的窗口。
 
-GUARD_LOG="$KIT_DIR/guard.log"
-GUARD_STAMP="$KIT_DIR/.guard.last"
-GUARD_UNIT="ai-ready-guard"
+GUARD_LOG="$KIT_DIR/watch.log"
+WATCH_PY="$KIT_DIR/bin/aiready-watch.py"
+WATCH_PID="$KIT_DIR/.watch.pid"
+GOLD_DIR="$KIT_DIR/.gold"
 
-drift_count() {   # $1=目标，输出与 new/ 不一致或缺失的文件数
-    local t="$1" f rel n=0
-    [ -d "$NEW_DIR" ] || { printf '0'; return 0; }
-    while IFS= read -r f; do
-        rel="${f#"$NEW_DIR/"}"
-        if [ ! -f "$t/$rel" ] || ! cmp -s "$f" "$t/$rel"; then n=$((n+1)); fi
-    done < <(find "$NEW_DIR" -type f 2>/dev/null)
-    printf '%s' "$n"
+# 守护脚本以 base64 内嵌：curl 单文件完成全部安装，不额外拉第二个文件，
+# 也不会因为 raw.githubusercontent 限流而装一半。
+watcher_b64() {
+    cat <<'AIREADY_WATCHER_B64'
+IyEvdXNyL2Jpbi9lbnYgcHl0aG9uMwojIC0qLSBjb2Rpbmc6IHV0Zi04IC0qLQoiIiJhaXJlYWR5
+LXdhdGNoLnB5IOKAlCAuYWktcmVhZHkg5qih5p2/55uu5b2V5a6e5pe25a6I5oqkCgrlubPlj7Dm
+r4/mrKHliIfmjaLmqKHlnosgLyDph43lvIDpobnnm67vvIzkvJrmioogcHJvamVjdC10cGwg6YeM
+55qEIC5haS1yZWFkeSDph43pk7rkuIDpgY0K77yIY3JlYXRlIC54eHgudG1wLjxyYW5kPiDihpIg
+cmVuYW1l77yJ77yM5pys5Zyw5pS55YaZ6KKr6KaG55uW44CCCuacrOi/m+eoi+ebkeWQrOmCo+S4
+quebruW9le+8jOS4gOaXpuWPkeeUn+WGmS/mm7/mjaIv5Yig6Zmk77yM56uL5Y2z5oyJ5Z+65YeG
+5Ymv5pys5YWo6YeP5YaZ5Zue44CCCgrlt6XkvZzlsYLmrKHvvIjkuInlsYLvvIzku47lv6vliLDm
+haLvvInvvJoKICAxLiBpbm90aWZ5IOS6i+S7tiAgIENMT1NFX1dSSVRFIC8gTU9WRURfVE8gLyBD
+UkVBVEUgLyBERUxFVEUgLi4uIOavq+enkue6pwogIDIuIOmdmem7mOWQiOW5tiAgICAgICDlkIzm
+ibnkuovku7blgZwgNTBtcyDmlLbpvZDvvIzkuIDmrKHmr5Tlr7nvvIzpgb/lhY0gMjAg5qyh6YeN
+5aSN5omr5o+PCiAgMy4g6L2u6K+i5YWc5bqVICAgICAgIOaXoOS6i+S7tuaXtuavj+enkuWFqOmH
+j+avlOWvueS4gOasoe+8iDI2IOaWh+S7tu+8jOW+ruenkue6p++8ie+8jAogICAgICAgICAgICAg
+ICAgICAgIOimhuebliBpbm90aWZ5IOS4ouS6i+S7tiAvIOmYn+WIl+a6ouWHuiAvIOebruW9leii
+q+aVtOajteaNouaOieeahOaDheWGtQogIOWPpuaciSBvcGVuY29kZSDov5vnqIvlkK/liqjmo4Dm
+tYvvvJrmlrAgcGlkIOWHuueOsOeri+WIu+avlOWvueS4gOasoe+8jOWgteS9jyLph43pk7og4oaS
+IOmHjeWQryLkuYvpl7TnmoTnqpflj6PjgIIKCuWtkOWRveS7pO+8mgogIGRhZW1vbiAgIOW4uOmp
+u++8iOm7mOiupO+8iQogIG9uY2UgICAgIOWNleasoeW3oeajgOW5tuWGmeWbngogIHN0YXR1cyAg
+IOaJk+WNsOeKtuaAge+8iFBJRCAvIOWtmOa0uyAvIOW9k+WJjeW3ruW8guaVsCAvIGlub3RpZnkg
+5Y+v55So77yJCiAgc3RvcCAgICAg5YGc5o6J5bi46am76L+b56iLCgrlj4LmlbDlhajpg6jlpJbn
+va7vvIznvLrnnIHlgLzmjIkgTW9ua2V5Q29kZSDlrrnlmajluIPlsYDmjqjlr7zjgIIKIiIiCgpp
+bXBvcnQgYXJncGFyc2UKaW1wb3J0IGN0eXBlcwppbXBvcnQgb3MKaW1wb3J0IHNlbGVjdAppbXBv
+cnQgc2lnbmFsCmltcG9ydCBzdHJ1Y3QKaW1wb3J0IHN5cwppbXBvcnQgdGltZQoKIyAtLS0tLS0t
+LS0tLS0tLS0tIGlub3RpZnkg5bi46YePIC0tLS0tLS0tLS0tLS0tLS0KSU5fQVRUUklCID0gMHgw
+MDAwMDAwNApJTl9DTE9TRV9XUklURSA9IDB4MDAwMDAwMDgKSU5fTU9WRURfRlJPTSA9IDB4MDAw
+MDAwNDAKSU5fTU9WRURfVE8gPSAweDAwMDAwMDgwCklOX0NSRUFURSA9IDB4MDAwMDAxMDAKSU5f
+REVMRVRFID0gMHgwMDAwMDIwMApJTl9ERUxFVEVfU0VMRiA9IDB4MDAwMDA0MDAKSU5fTU9WRV9T
+RUxGID0gMHgwMDAwMDgwMApJTl9RX09WRVJGTE9XID0gMHgwMDAwNDAwMApJTl9JU0RJUiA9IDB4
+NDAwMDAwMDAKCldBVENIX01BU0sgPSAoCiAgICBJTl9BVFRSSUIgfCBJTl9DTE9TRV9XUklURSB8
+IElOX01PVkVEX0ZST00gfCBJTl9NT1ZFRF9UTwogICAgfCBJTl9DUkVBVEUgfCBJTl9ERUxFVEUg
+fCBJTl9ERUxFVEVfU0VMRiB8IElOX01PVkVfU0VMRgopCgpFVkVOVF9IRFIgPSBzdHJ1Y3QuY2Fs
+Y3NpemUoImlJSUkiKQoKIyDlj6rplZzlg4/ov5nkuKTkuKrlrZDnm67lvZXov5vln7rlh4blia/m
+nKzvvIzpgb/lhY3mioogYmFja3Vwcy/jgIFiaW4vIOS5i+exu+W4pui/m+WOuwpTVUJESVJTID0g
+KCJydWxlcyIsICJza2lsbHMiKQoKUVVJRVQgPSAwLjA1ICAgICAgIyDkuovku7blkIjlubbnqpfl
+j6PvvIjnp5LvvIkKVElDSyA9IDAuMiAgICAgICAgIyBzZWxlY3Qg6LaF5pe2Ck9QQ0hFQ0sgPSAx
+LjUgICAgICMgb3BlbmNvZGUg6L+b56iL5omr5o+P6Ze06ZqUCgoKZGVmIG5vdygpOgogICAgcmV0
+dXJuIHRpbWUuc3RyZnRpbWUoIiVZLSVtLSVkVCVIOiVNOiVTWiIsIHRpbWUuZ210aW1lKCkpCgoK
+IyAtLS0tLS0tLS0tLS0tLS0tIOmFjee9riAtLS0tLS0tLS0tLS0tLS0tCgpjbGFzcyBDZmcob2Jq
+ZWN0KToKICAgIGRlZiBfX2luaXRfXyhzZWxmLCBhKToKICAgICAgICBoZXJlID0gb3MucGF0aC5k
+aXJuYW1lKG9zLnBhdGguYWJzcGF0aChfX2ZpbGVfXykpCiAgICAgICAga2l0ID0gb3MucGF0aC5k
+aXJuYW1lKGhlcmUpICAgICAgICAgICAgICAgICAgICAgICMgPGtpdD4vYmluL3gucHkg4oaSIDxr
+aXQ+CiAgICAgICAgc2VsZi50cGwgPSBhLnRwbCBvciBmaW5kX3RwbCgpCiAgICAgICAgc2VsZi5z
+cmMgPSBhLnNyYyBvciBvcy5wYXRoLmpvaW4oa2l0LCAibmV3IikKICAgICAgICBzZWxmLmdvbGQg
+PSBhLmdvbGQgb3Igb3MucGF0aC5qb2luKGtpdCwgIi5nb2xkIikKICAgICAgICBzZWxmLnBpZGZp
+bGUgPSBhLnBpZCBvciBvcy5wYXRoLmpvaW4oa2l0LCAiLndhdGNoLnBpZCIpCiAgICAgICAgc2Vs
+Zi5sb2dmaWxlID0gYS5sb2cgb3Igb3MucGF0aC5qb2luKGtpdCwgIndhdGNoLmxvZyIpCiAgICAg
+ICAgc2VsZi5pbnRlcnZhbCA9IGEuaW50ZXJ2YWwKICAgICAgICBzZWxmLmtpdCA9IGtpdAoKICAg
+IGRlZiBvayhzZWxmKToKICAgICAgICByZXR1cm4gYm9vbChzZWxmLnRwbCkgYW5kIG9zLnBhdGgu
+aXNkaXIoc2VsZi50cGwpCgoKZGVmIGZpbmRfdHBsKCk6CiAgICAiIiLmjInlt7Lnn6XluIPlsYDm
+ib7ooqvph43pk7rnmoTmqKHmnb/nm67lvZXvvJvpg73kuI3lnKjlsLHmiasgcHJvamVjdC10cGzj
+gIIiIiIKICAgIGZpeGVkID0gKAogICAgICAgICIvcm9vdC8uY29kaW5nbWF0cml4L3Byb2plY3Qt
+dHBsLy5haS1yZWFkeSIsCiAgICAgICAgIi93b3Jrc3BhY2UvLmNvZGluZ21hdHJpeC9wcm9qZWN0
+LXRwbC8uYWktcmVhZHkiLAogICAgICAgICIvd29ya3NwYWNlL3Byb2plY3QtdHBsLy5haS1yZWFk
+eSIsCiAgICApCiAgICBmb3IgcCBpbiBmaXhlZDoKICAgICAgICBpZiBvcy5wYXRoLmlzZGlyKG9z
+LnBhdGguam9pbihwLCAicnVsZXMiKSk6CiAgICAgICAgICAgIHJldHVybiBwCiAgICBmb3Igcm9v
+dCBpbiAoIi9yb290IiwgIi93b3Jrc3BhY2UiKToKICAgICAgICBpZiBub3Qgb3MucGF0aC5pc2Rp
+cihyb290KToKICAgICAgICAgICAgY29udGludWUKICAgICAgICBiYXNlX2RlcHRoID0gcm9vdC5y
+c3RyaXAoIi8iKS5jb3VudCgiLyIpCiAgICAgICAgZm9yIGRpcnBhdGgsIGRpcm5hbWVzLCBfIGlu
+IG9zLndhbGsocm9vdCk6CiAgICAgICAgICAgIGlmIGRpcnBhdGguY291bnQoIi8iKSAtIGJhc2Vf
+ZGVwdGggPiA1OgogICAgICAgICAgICAgICAgZGlybmFtZXNbOl0gPSBbXQogICAgICAgICAgICAg
+ICAgY29udGludWUKICAgICAgICAgICAgZGlybmFtZXNbOl0gPSBbZCBmb3IgZCBpbiBkaXJuYW1l
+cwogICAgICAgICAgICAgICAgICAgICAgICAgICBpZiBkIG5vdCBpbiAoIm5vZGVfbW9kdWxlcyIs
+ICIuZ2l0IiwgIl9fcHljYWNoZV9fIildCiAgICAgICAgICAgIGlmIG5vdCBkaXJwYXRoLmVuZHN3
+aXRoKCJwcm9qZWN0LXRwbCIpOgogICAgICAgICAgICAgICAgY29udGludWUKICAgICAgICAgICAg
+Y2FuZCA9IG9zLnBhdGguam9pbihkaXJwYXRoLCAiLmFpLXJlYWR5IikKICAgICAgICAgICAgZm9y
+IGMgaW4gKGNhbmQsIGRpcnBhdGgpOgogICAgICAgICAgICAgICAgaWYgb3MucGF0aC5pc2Rpcihv
+cy5wYXRoLmpvaW4oYywgInJ1bGVzIikpOgogICAgICAgICAgICAgICAgICAgIHJldHVybiBjCiAg
+ICByZXR1cm4gIiIKCgojIC0tLS0tLS0tLS0tLS0tLS0g5pel5b+XIC0tLS0tLS0tLS0tLS0tLS0K
+CmRlZiBzYXkoY2ZnLCBtc2cpOgogICAgbGluZSA9ICIlcyAlc1xuIiAlIChub3coKSwgbXNnKQog
+ICAgdHJ5OgogICAgICAgIHN5cy5zdGRvdXQud3JpdGUobGluZSkKICAgICAgICBzeXMuc3Rkb3V0
+LmZsdXNoKCkKICAgIGV4Y2VwdCAoQnJva2VuUGlwZUVycm9yLCBWYWx1ZUVycm9yKToKICAgICAg
+ICBwYXNzCiAgICB0cnk6CiAgICAgICAgaWYgb3MucGF0aC5leGlzdHMoY2ZnLmxvZ2ZpbGUpIGFu
+ZCBvcy5wYXRoLmdldHNpemUoY2ZnLmxvZ2ZpbGUpID4gNTI0Mjg4OgogICAgICAgICAgICB3aXRo
+IG9wZW4oY2ZnLmxvZ2ZpbGUsICJyYiIpIGFzIGY6CiAgICAgICAgICAgICAgICBmLnNlZWsoLTQw
+OTYwLCBvcy5TRUVLX0VORCkKICAgICAgICAgICAgICAgIHRhaWwgPSBmLnJlYWQoKS5zcGxpdChi
+IlxuIiwgMSlbLTFdCiAgICAgICAgICAgIHdpdGggb3BlbihjZmcubG9nZmlsZSwgIndiIikgYXMg
+ZjoKICAgICAgICAgICAgICAgIGYud3JpdGUodGFpbCkKICAgICAgICB3aXRoIG9wZW4oY2ZnLmxv
+Z2ZpbGUsICJhIikgYXMgZjoKICAgICAgICAgICAgZi53cml0ZShsaW5lKQogICAgZXhjZXB0IE9T
+RXJyb3I6CiAgICAgICAgcGFzcwoKCiMgLS0tLS0tLS0tLS0tLS0tLSDln7rlh4blia/mnKwgLS0t
+LS0tLS0tLS0tLS0tLQoKZGVmIHdhbGtfZmlsZXMocm9vdCk6CiAgICBvdXQgPSBbXQogICAgZm9y
+IHN1YiBpbiBTVUJESVJTOgogICAgICAgIGQgPSBvcy5wYXRoLmpvaW4ocm9vdCwgc3ViKQogICAg
+ICAgIGlmIG5vdCBvcy5wYXRoLmlzZGlyKGQpOgogICAgICAgICAgICBjb250aW51ZQogICAgICAg
+IGZvciBkaXJwYXRoLCBkaXJuYW1lcywgZmlsZW5hbWVzIGluIG9zLndhbGsoZCk6CiAgICAgICAg
+ICAgIGRpcm5hbWVzWzpdID0gW3ggZm9yIHggaW4gZGlybmFtZXMgaWYgeCAhPSAiX19weWNhY2hl
+X18iXQogICAgICAgICAgICBmb3IgZm4gaW4gZmlsZW5hbWVzOgogICAgICAgICAgICAgICAgaWYg
+Zm4uZW5kc3dpdGgoIi5weWMiKToKICAgICAgICAgICAgICAgICAgICBjb250aW51ZQogICAgICAg
+ICAgICAgICAgb3V0LmFwcGVuZChvcy5wYXRoLmpvaW4oZGlycGF0aCwgZm4pKQogICAgcmV0dXJu
+IG91dAoKCmRlZiBiYWtlKGNmZyk6CiAgICAiIiLmiormlLnlhpnniYjovb3ojbfvvIhraXQvbmV3
+77yJ6ZWc5YOP5oiQIGdvbGQg5Z+65YeG77yM5bm25riF5o6JIGdvbGQg6YeM5bey5LiN5a2Y5Zyo
+55qE5paH5Lu244CCIiIiCiAgICBpZiBub3Qgb3MucGF0aC5pc2RpcihjZmcuc3JjKToKICAgICAg
+ICByYWlzZSBTeXN0ZW1FeGl0KCLovb3ojbfnm67lvZXkuI3lrZjlnKg6ICVz77yI5YWIIGluc3Rh
+bGwgLyByZXBhaXLvvIkiICUgY2ZnLnNyYykKICAgIG4gPSAwCiAgICBrZWVwID0gc2V0KCkKICAg
+IGZvciBzcmMgaW4gd2Fsa19maWxlcyhjZmcuc3JjKToKICAgICAgICByZWwgPSBvcy5wYXRoLnJl
+bHBhdGgoc3JjLCBjZmcuc3JjKQogICAgICAgIGtlZXAuYWRkKHJlbCkKICAgICAgICBkc3QgPSBv
+cy5wYXRoLmpvaW4oY2ZnLmdvbGQsIHJlbCkKICAgICAgICB0cnk6CiAgICAgICAgICAgIHdpdGgg
+b3BlbihzcmMsICJyYiIpIGFzIGY6CiAgICAgICAgICAgICAgICBkYXRhID0gZi5yZWFkKCkKICAg
+ICAgICBleGNlcHQgT1NFcnJvcjoKICAgICAgICAgICAgY29udGludWUKICAgICAgICBzYW1lID0g
+RmFsc2UKICAgICAgICB0cnk6CiAgICAgICAgICAgIHdpdGggb3Blbihkc3QsICJyYiIpIGFzIGY6
+CiAgICAgICAgICAgICAgICBzYW1lID0gZi5yZWFkKCkgPT0gZGF0YQogICAgICAgIGV4Y2VwdCBP
+U0Vycm9yOgogICAgICAgICAgICBwYXNzCiAgICAgICAgaWYgbm90IHNhbWU6CiAgICAgICAgICAg
+IGQgPSBvcy5wYXRoLmRpcm5hbWUoZHN0KQogICAgICAgICAgICBpZiBkOgogICAgICAgICAgICAg
+ICAgb3MubWFrZWRpcnMoZCwgZXhpc3Rfb2s9VHJ1ZSkKICAgICAgICAgICAgd2l0aCBvcGVuKGRz
+dCwgIndiIikgYXMgZjoKICAgICAgICAgICAgICAgIGYud3JpdGUoZGF0YSkKICAgICAgICBuICs9
+IDEKICAgICMg5riF5o6JIGdvbGQg6YeM5bey6KKr6L296I235Yig6Zmk55qE5pen5paH5Lu277yM
+5ZCm5YiZ5Lya5LiA55u05b6A5qih5p2/6YeM5oGi5aSN5bm954G15paH5Lu2CiAgICBmb3IgZGly
+cGF0aCwgXywgZmlsZW5hbWVzIGluIG9zLndhbGsoY2ZnLmdvbGQpOgogICAgICAgIGZvciBmbiBp
+biBmaWxlbmFtZXM6CiAgICAgICAgICAgIHAgPSBvcy5wYXRoLmpvaW4oZGlycGF0aCwgZm4pCiAg
+ICAgICAgICAgIGlmIG9zLnBhdGgucmVscGF0aChwLCBjZmcuZ29sZCkgbm90IGluIGtlZXA6CiAg
+ICAgICAgICAgICAgICB0cnk6CiAgICAgICAgICAgICAgICAgICAgb3MudW5saW5rKHApCiAgICAg
+ICAgICAgICAgICBleGNlcHQgT1NFcnJvcjoKICAgICAgICAgICAgICAgICAgICBwYXNzCiAgICBy
+ZXR1cm4gbgoKCmRlZiBnb2xkX2l0ZW1zKGNmZyk6CiAgICAiIiLkuqflh7ogKOWfuuWHhuaWh+S7
+tiwg55uu5qCH5paH5Lu2KSDlr7nvvIzlubbkv53mjIEgcnVsZXMg5ZyoIHNraWxscyDkuYvliY3j
+gIIiIiIKICAgIG91dCA9IFtdCiAgICBmb3Igc3ViIGluIFNVQkRJUlM6CiAgICAgICAgZCA9IG9z
+LnBhdGguam9pbihjZmcuZ29sZCwgc3ViKQogICAgICAgIGlmIG5vdCBvcy5wYXRoLmlzZGlyKGQp
+OgogICAgICAgICAgICBjb250aW51ZQogICAgICAgIGZvciBkaXJwYXRoLCBkaXJuYW1lcywgZmls
+ZW5hbWVzIGluIG9zLndhbGsoZCk6CiAgICAgICAgICAgIGRpcm5hbWVzLnNvcnQoKQogICAgICAg
+ICAgICBmb3IgZm4gaW4gc29ydGVkKGZpbGVuYW1lcyk6CiAgICAgICAgICAgICAgICBzcmMgPSBv
+cy5wYXRoLmpvaW4oZGlycGF0aCwgZm4pCiAgICAgICAgICAgICAgICBvdXQuYXBwZW5kKChzcmMs
+IG9zLnBhdGguam9pbihjZmcudHBsLCBvcy5wYXRoLnJlbHBhdGgoc3JjLCBjZmcuZ29sZCkpKSkK
+ICAgIHJldHVybiBvdXQKCgpkZWYgZGlmZl9jb3VudChjZmcpOgogICAgbiA9IDAKICAgIGZvciBz
+cmMsIGRzdCBpbiBnb2xkX2l0ZW1zKGNmZyk6CiAgICAgICAgdHJ5OgogICAgICAgICAgICBpZiBv
+cy5wYXRoLmdldHNpemUoc3JjKSAhPSBvcy5wYXRoLmdldHNpemUoZHN0KToKICAgICAgICAgICAg
+ICAgIG4gKz0gMQogICAgICAgICAgICAgICAgY29udGludWUKICAgICAgICAgICAgd2l0aCBvcGVu
+KHNyYywgInJiIikgYXMgYSwgb3Blbihkc3QsICJyYiIpIGFzIGI6CiAgICAgICAgICAgICAgICBp
+ZiBhLnJlYWQoKSAhPSBiLnJlYWQoKToKICAgICAgICAgICAgICAgICAgICBuICs9IDEKICAgICAg
+ICBleGNlcHQgT1NFcnJvcjoKICAgICAgICAgICAgbiArPSAxCiAgICByZXR1cm4gbgoKCmRlZiBy
+ZXN0b3JlKGNmZywgcmVhc29uKToKICAgICIiIuWFqOmHj+avlOWvueWQjuWGmeWbnuOAgui/lOWb
+niAo5YaZ5Zue5pWwLCDlpLHotKXmlbAsIOaWh+S7tuWQjeWIl+ihqCnjgIIiIiIKICAgIHQwID0g
+dGltZS50aW1lKCkKICAgIG4gPSBmYWlsID0gMAogICAgbmFtZXMgPSBbXQogICAgZm9yIHNyYywg
+ZHN0IGluIGdvbGRfaXRlbXMoY2ZnKToKICAgICAgICB0cnk6CiAgICAgICAgICAgIHdpdGggb3Bl
+bihzcmMsICJyYiIpIGFzIGY6CiAgICAgICAgICAgICAgICBkYXRhID0gZi5yZWFkKCkKICAgICAg
+ICBleGNlcHQgT1NFcnJvcjoKICAgICAgICAgICAgZmFpbCArPSAxCiAgICAgICAgICAgIGNvbnRp
+bnVlCiAgICAgICAgY3VyID0gTm9uZQogICAgICAgIHRyeToKICAgICAgICAgICAgd2l0aCBvcGVu
+KGRzdCwgInJiIikgYXMgZjoKICAgICAgICAgICAgICAgIGN1ciA9IGYucmVhZCgpCiAgICAgICAg
+ZXhjZXB0IE9TRXJyb3I6CiAgICAgICAgICAgIGN1ciA9IE5vbmUKICAgICAgICBpZiBjdXIgPT0g
+ZGF0YToKICAgICAgICAgICAgY29udGludWUKICAgICAgICB0cnk6CiAgICAgICAgICAgIGQgPSBv
+cy5wYXRoLmRpcm5hbWUoZHN0KQogICAgICAgICAgICBpZiBkOgogICAgICAgICAgICAgICAgb3Mu
+bWFrZWRpcnMoZCwgZXhpc3Rfb2s9VHJ1ZSkKICAgICAgICAgICAgIyDnm7TmjqXopoblhpnogIzp
+nZ4gcmVuYW1l77yacmVuYW1lIOS8muaNoiBpbm9kZe+8jOmDqOWIhiB3YXRjaGVyIOS8muWboOat
+pAogICAgICAgICAgICAjIOinpuWPkeS6jOasoeS6i+S7tu+8jOW9ouaIkOiHqua/gOW+queOrwog
+ICAgICAgICAgICB3aXRoIG9wZW4oZHN0LCAid2IiKSBhcyBmOgogICAgICAgICAgICAgICAgZi53
+cml0ZShkYXRhKQogICAgICAgICAgICBuICs9IDEKICAgICAgICAgICAgbmFtZXMuYXBwZW5kKG9z
+LnBhdGguYmFzZW5hbWUoZHN0KSkKICAgICAgICBleGNlcHQgT1NFcnJvcjoKICAgICAgICAgICAg
+ZmFpbCArPSAxCiAgICBpZiBuIG9yIGZhaWw6CiAgICAgICAgc2F5KGNmZywgIlJFU1RPUkVEIG49
+JWQgZmFpbD0lZCByZWFzb249JXMgZWxhcHNlZD0lLjNmcyIgJQogICAgICAgICAgICAobiwgZmFp
+bCwgcmVhc29uLCB0aW1lLnRpbWUoKSAtIHQwKSkKICAgIHJldHVybiBuLCBmYWlsLCBuYW1lcwoK
+CiMgLS0tLS0tLS0tLS0tLS0tLSBpbm90aWZ5IC0tLS0tLS0tLS0tLS0tLS0KCmNsYXNzIFdhdGNo
+ZXIob2JqZWN0KToKICAgIGRlZiBfX2luaXRfXyhzZWxmKToKICAgICAgICB0cnk6CiAgICAgICAg
+ICAgIGxpYmMgPSBjdHlwZXMuQ0RMTCgibGliYy5zby42IiwgdXNlX2Vycm5vPVRydWUpCiAgICAg
+ICAgICAgIHNlbGYuX2FkZCA9IGxpYmMuaW5vdGlmeV9hZGRfd2F0Y2gKICAgICAgICAgICAgc2Vs
+Zi5fYWRkLmFyZ3R5cGVzID0gW2N0eXBlcy5jX2ludCwgY3R5cGVzLmNfY2hhcl9wLCBjdHlwZXMu
+Y191aW50MzJdCiAgICAgICAgICAgIHNlbGYuX2FkZC5yZXN0eXBlID0gY3R5cGVzLmNfaW50CiAg
+ICAgICAgICAgIHNlbGYuZmQgPSBsaWJjLmlub3RpZnlfaW5pdDEob3MuT19OT05CTE9DSykKICAg
+ICAgICBleGNlcHQgKE9TRXJyb3IsIEF0dHJpYnV0ZUVycm9yKToKICAgICAgICAgICAgc2VsZi5m
+ZCA9IC0xCiAgICAgICAgaWYgc2VsZi5mZCA8IDA6CiAgICAgICAgICAgIHJhaXNlIE9TRXJyb3Io
+Imlub3RpZnkg5LiN5Y+v55SoIikKICAgICAgICBzZWxmLndkcyA9IHt9CgogICAgZGVmIGFkZChz
+ZWxmLCBwYXRoKToKICAgICAgICB3ZCA9IHNlbGYuX2FkZChzZWxmLmZkLCBwYXRoLmVuY29kZSgp
+LCBXQVRDSF9NQVNLKQogICAgICAgIGlmIHdkIDwgMDoKICAgICAgICAgICAgcmV0dXJuIC0xCiAg
+ICAgICAgc2VsZi53ZHNbd2RdID0gcGF0aAogICAgICAgIHJldHVybiB3ZAoKICAgIGRlZiBhZGRf
+dHJlZShzZWxmLCByb290KToKICAgICAgICBjbnQgPSAwCiAgICAgICAgaWYgc2VsZi5hZGQocm9v
+dCkgPj0gMDoKICAgICAgICAgICAgY250ICs9IDEKICAgICAgICBmb3Igc3ViIGluIFNVQkRJUlM6
+CiAgICAgICAgICAgIGQgPSBvcy5wYXRoLmpvaW4ocm9vdCwgc3ViKQogICAgICAgICAgICBpZiBv
+cy5wYXRoLmlzZGlyKGQpIGFuZCBzZWxmLmFkZChkKSA+PSAwOgogICAgICAgICAgICAgICAgY250
+ICs9IDEKICAgICAgICByZXR1cm4gY250CgogICAgZGVmIHJlYWQoc2VsZik6CiAgICAgICAgb3V0
+ID0gW10KICAgICAgICB3aGlsZSBUcnVlOgogICAgICAgICAgICB0cnk6CiAgICAgICAgICAgICAg
+ICBidWYgPSBvcy5yZWFkKHNlbGYuZmQsIDY1NTM2KQogICAgICAgICAgICBleGNlcHQgKEJsb2Nr
+aW5nSU9FcnJvciwgSW50ZXJydXB0ZWRFcnJvcik6CiAgICAgICAgICAgICAgICBicmVhawogICAg
+ICAgICAgICBleGNlcHQgT1NFcnJvcjoKICAgICAgICAgICAgICAgIGJyZWFrCiAgICAgICAgICAg
+IGlmIG5vdCBidWY6CiAgICAgICAgICAgICAgICBicmVhawogICAgICAgICAgICBpID0gMAogICAg
+ICAgICAgICB3aGlsZSBpICsgRVZFTlRfSERSIDw9IGxlbihidWYpOgogICAgICAgICAgICAgICAg
+d2QsIG1hc2ssIF9jb29raWUsIGxuID0gc3RydWN0LnVucGFja19mcm9tKCJpSUlJIiwgYnVmLCBp
+KQogICAgICAgICAgICAgICAgaSArPSBFVkVOVF9IRFIKICAgICAgICAgICAgICAgIG5hbWUgPSBi
+dWZbaTppICsgbG5dLnNwbGl0KGIiXDAiKVswXS5kZWNvZGUoInV0Zi04IiwgInJlcGxhY2UiKQog
+ICAgICAgICAgICAgICAgaSArPSBsbgogICAgICAgICAgICAgICAgb3V0LmFwcGVuZCgod2QsIG1h
+c2ssIG5hbWUpKQogICAgICAgIHJldHVybiBvdXQKCgpkZWYgc2Nhbl9vcGVuY29kZSgpOgogICAg
+cGlkcyA9IHNldCgpCiAgICB0cnk6CiAgICAgICAgZm9yIGUgaW4gb3MubGlzdGRpcigiL3Byb2Mi
+KToKICAgICAgICAgICAgaWYgbm90IGUuaXNkaWdpdCgpOgogICAgICAgICAgICAgICAgY29udGlu
+dWUKICAgICAgICAgICAgdHJ5OgogICAgICAgICAgICAgICAgd2l0aCBvcGVuKCIvcHJvYy8lcy9j
+b21tIiAlIGUpIGFzIGY6CiAgICAgICAgICAgICAgICAgICAgaWYgZi5yZWFkKCkuc3RyaXAoKSA9
+PSAib3BlbmNvZGUiOgogICAgICAgICAgICAgICAgICAgICAgICBwaWRzLmFkZChpbnQoZSkpCiAg
+ICAgICAgICAgIGV4Y2VwdCBPU0Vycm9yOgogICAgICAgICAgICAgICAgY29udGludWUKICAgIGV4
+Y2VwdCBPU0Vycm9yOgogICAgICAgIHBhc3MKICAgIHJldHVybiBwaWRzCgoKIyAtLS0tLS0tLS0t
+LS0tLS0tIOWtkOWRveS7pCAtLS0tLS0tLS0tLS0tLS0tCgpkZWYgcmVhZF9waWQoY2ZnKToKICAg
+IHRyeToKICAgICAgICB3aXRoIG9wZW4oY2ZnLnBpZGZpbGUpIGFzIGY6CiAgICAgICAgICAgIHJl
+dHVybiBpbnQoZi5yZWFkKCkuc3RyaXAoKSBvciAwKQogICAgZXhjZXB0IChPU0Vycm9yLCBWYWx1
+ZUVycm9yKToKICAgICAgICByZXR1cm4gMAoKCmRlZiBhbGl2ZShwaWQpOgogICAgcmV0dXJuIGJv
+b2wocGlkKSBhbmQgb3MucGF0aC5pc2RpcigiL3Byb2MvJWQiICUgcGlkKQoKCmRlZiBjbWRfc3Rh
+dHVzKGNmZyk6CiAgICBmaWxlcyA9IGxlbihnb2xkX2l0ZW1zKGNmZykpIGlmIG9zLnBhdGguaXNk
+aXIoY2ZnLmdvbGQpIGVsc2UgMAogICAgcGlkID0gcmVhZF9waWQoY2ZnKQogICAgcHJpbnQoIlRQ
+TD0lcyIgJSAoY2ZnLnRwbCBvciAiKOacquaJvuWIsCkiKSkKICAgIHByaW50KCJHT0xEPSVzIGZp
+bGVzPSVkIiAlIChjZmcuZ29sZCwgZmlsZXMpKQogICAgcHJpbnQoIlNSQz0lcyIgJSBjZmcuc3Jj
+KQogICAgcHJpbnQoIlBJRD0lcyBBTElWRT0lcyIgJSAocGlkIG9yICItIiwgInllcyIgaWYgYWxp
+dmUocGlkKSBlbHNlICJubyIpKQogICAgcHJpbnQoIkRJRkZfTk9XPSVkIiAlIChkaWZmX2NvdW50
+KGNmZykgaWYgY2ZnLm9rKCkgYW5kIGZpbGVzIGVsc2UgLTEpKQogICAgdHJ5OgogICAgICAgIHcg
+PSBXYXRjaGVyKCkKICAgICAgICBvcy5jbG9zZSh3LmZkKQogICAgICAgIHByaW50KCJJTk9USUZZ
+PXllcyIpCiAgICBleGNlcHQgT1NFcnJvcjoKICAgICAgICBwcmludCgiSU5PVElGWT1ubyIpCiAg
+ICBpZiBvcy5wYXRoLmlzZmlsZShjZmcubG9nZmlsZSk6CiAgICAgICAgcHJpbnQoIi0tLSBsYXN0
+IDQgLS0tIikKICAgICAgICB0cnk6CiAgICAgICAgICAgIHdpdGggb3BlbihjZmcubG9nZmlsZSwg
+InIiLCBlcnJvcnM9InJlcGxhY2UiKSBhcyBmOgogICAgICAgICAgICAgICAgZm9yIGxpbmUgaW4g
+Zi5yZWFkKCkuc3RyaXAoKS5zcGxpdGxpbmVzKClbLTQ6XToKICAgICAgICAgICAgICAgICAgICBw
+cmludChsaW5lKQogICAgICAgIGV4Y2VwdCBPU0Vycm9yOgogICAgICAgICAgICBwYXNzCiAgICBy
+ZXR1cm4gMAoKCmRlZiBjbWRfc3RvcChjZmcpOgogICAgcGlkID0gcmVhZF9waWQoY2ZnKQogICAg
+aWYgbm90IGFsaXZlKHBpZCk6CiAgICAgICAgdHJ5OgogICAgICAgICAgICBvcy51bmxpbmsoY2Zn
+LnBpZGZpbGUpCiAgICAgICAgZXhjZXB0IE9TRXJyb3I6CiAgICAgICAgICAgIHBhc3MKICAgICAg
+ICBwcmludCgi5pyq5Zyo6L+Q6KGMIikKICAgICAgICByZXR1cm4gMAogICAgdHJ5OgogICAgICAg
+IG9zLmtpbGwocGlkLCBzaWduYWwuU0lHVEVSTSkKICAgIGV4Y2VwdCBPU0Vycm9yIGFzIGU6CiAg
+ICAgICAgcHJpbnQoIuWPkemAgeS/oeWPt+Wksei0pTogJXMiICUgZSkKICAgICAgICByZXR1cm4g
+MQogICAgZm9yIF8gaW4gcmFuZ2UoNTApOgogICAgICAgIGlmIG5vdCBhbGl2ZShwaWQpOgogICAg
+ICAgICAgICBicmVhawogICAgICAgIHRpbWUuc2xlZXAoMC4wNSkKICAgIGlmIGFsaXZlKHBpZCk6
+CiAgICAgICAgdHJ5OgogICAgICAgICAgICBvcy5raWxsKHBpZCwgc2lnbmFsLlNJR0tJTEwpCiAg
+ICAgICAgZXhjZXB0IE9TRXJyb3I6CiAgICAgICAgICAgIHBhc3MKICAgIHRyeToKICAgICAgICBv
+cy51bmxpbmsoY2ZnLnBpZGZpbGUpCiAgICBleGNlcHQgT1NFcnJvcjoKICAgICAgICBwYXNzCiAg
+ICBwcmludCgiU1RPUFBFRCBwaWQ9JWQiICUgcGlkKQogICAgcmV0dXJuIDAKCgpkZWYgY21kX29u
+Y2UoY2ZnKToKICAgIGlmIG5vdCBjZmcub2soKToKICAgICAgICBwcmludCgi5qih5p2/55uu5b2V
+5LiN5a2Y5ZyoOiAlcyIgJSBjZmcudHBsKQogICAgICAgIHJldHVybiAxCiAgICBuID0gYmFrZShj
+ZmcpCiAgICBnb3QsIGZhaWwsIF8gPSByZXN0b3JlKGNmZywgIm9uY2UiKQogICAgcHJpbnQoIkJB
+S0VEIGZpbGVzPSVkIFJFU1RPUkVEIG49JWQgZmFpbD0lZCIgJSAobiwgZ290LCBmYWlsKSkKICAg
+IHJldHVybiAwCgoKZGVmIGNtZF9kYWVtb24oY2ZnKToKICAgIGlmIG5vdCBjZmcub2soKToKICAg
+ICAgICBwcmludCgi5qih5p2/55uu5b2V5LiN5a2Y5ZyoOiAlcyIgJSBjZmcudHBsKQogICAgICAg
+IHJldHVybiAxCiAgICBmaWxlcyA9IGJha2UoY2ZnKQogICAgZCA9IG9zLnBhdGguZGlybmFtZShj
+ZmcucGlkZmlsZSkKICAgIGlmIGQ6CiAgICAgICAgb3MubWFrZWRpcnMoZCwgZXhpc3Rfb2s9VHJ1
+ZSkKICAgIHdpdGggb3BlbihjZmcucGlkZmlsZSwgInciKSBhcyBmOgogICAgICAgIGYud3JpdGUo
+c3RyKG9zLmdldHBpZCgpKSkKICAgIHNheShjZmcsICJXQVRDSF9TVEFSVCBwaWQ9JWQgdHBsPSVz
+IGdvbGQ9JXMgZmlsZXM9JWQiICUKICAgICAgICAob3MuZ2V0cGlkKCksIGNmZy50cGwsIGNmZy5n
+b2xkLCBmaWxlcykpCgogICAgdHJ5OgogICAgICAgIHcgPSBXYXRjaGVyKCkKICAgIGV4Y2VwdCBP
+U0Vycm9yIGFzIGU6CiAgICAgICAgc2F5KGNmZywgIldBVENIX0ZBSUwgaW5vdGlmeTogJXPvvIjp
+mY3nuqfkuLrnuq/ova7or6LvvIkiICUgZSkKICAgICAgICB3ID0gTm9uZQogICAgaWYgdyBpcyBu
+b3QgTm9uZToKICAgICAgICBuID0gdy5hZGRfdHJlZShjZmcudHBsKQogICAgICAgIHNheShjZmcs
+ICJJTk9USUZZX09LIGRpcnM9JWQiICUgbikKCiAgICBzdG9wID0geyJvbiI6IEZhbHNlfQoKICAg
+IGRlZiBfc2lnKF9zLCBfZik6CiAgICAgICAgc3RvcFsib24iXSA9IFRydWUKCiAgICBzaWduYWwu
+c2lnbmFsKHNpZ25hbC5TSUdURVJNLCBfc2lnKQogICAgc2lnbmFsLnNpZ25hbChzaWduYWwuU0lH
+SU5ULCBfc2lnKQoKICAgIHNlZW5fb2MgPSBzY2FuX29wZW5jb2RlKCkKICAgIHNheShjZmcsICJP
+UEVOQ09ERV9UUkFDSyBpbml0PSVzIiAlIHNvcnRlZChzZWVuX29jKSkKCiAgICBsYXN0X3RpY2sg
+PSB0aW1lLnRpbWUoKQogICAgbGFzdF9vYyA9IHRpbWUudGltZSgpCiAgICB0cnk6CiAgICAgICAg
+d2hpbGUgbm90IHN0b3BbIm9uIl06CiAgICAgICAgICAgIGZkcyA9IFt3LmZkXSBpZiB3IGlzIG5v
+dCBOb25lIGVsc2UgW10KICAgICAgICAgICAgdHJ5OgogICAgICAgICAgICAgICAgciwgXywgXyA9
+IHNlbGVjdC5zZWxlY3QoZmRzLCBbXSwgW10sIFRJQ0spCiAgICAgICAgICAgIGV4Y2VwdCAoT1NF
+cnJvciwgSW50ZXJydXB0ZWRFcnJvcik6CiAgICAgICAgICAgICAgICByID0gW10KICAgICAgICAg
+ICAgaWYgcjoKICAgICAgICAgICAgICAgIHRfZXYgPSB0aW1lLnRpbWUoKQogICAgICAgICAgICAg
+ICAgZXZzID0gdy5yZWFkKCkKICAgICAgICAgICAgICAgIGRlYWRsaW5lID0gdGltZS50aW1lKCkg
+KyBRVUlFVAogICAgICAgICAgICAgICAgd2hpbGUgdGltZS50aW1lKCkgPCBkZWFkbGluZToKICAg
+ICAgICAgICAgICAgICAgICB0cnk6CiAgICAgICAgICAgICAgICAgICAgICAgIHIyLCBfLCBfID0g
+c2VsZWN0LnNlbGVjdChbdy5mZF0sIFtdLCBbXSwgUVVJRVQpCiAgICAgICAgICAgICAgICAgICAg
+ZXhjZXB0IChPU0Vycm9yLCBJbnRlcnJ1cHRlZEVycm9yKToKICAgICAgICAgICAgICAgICAgICAg
+ICAgYnJlYWsKICAgICAgICAgICAgICAgICAgICBpZiBub3QgcjI6CiAgICAgICAgICAgICAgICAg
+ICAgICAgIGJyZWFrCiAgICAgICAgICAgICAgICAgICAgZXZzICs9IHcucmVhZCgpCiAgICAgICAg
+ICAgICAgICAjIOebruW9leacrOi6q+iiq+WIoCAvIOiiq+aVtOajteaNouaOiSAvIOmYn+WIl+a6
+ouWHuiDihpIg5penIHdkIOWFqOWkseaViO+8jOmHjeW7uuebkeWQrAogICAgICAgICAgICAgICAg
+cmVidWlsZCA9IEZhbHNlCiAgICAgICAgICAgICAgICBmb3IgX3dkLCBtLCBfbiBpbiBldnM6CiAg
+ICAgICAgICAgICAgICAgICAgaWYgbSAmIChJTl9ERUxFVEVfU0VMRiB8IElOX01PVkVfU0VMRiB8
+IElOX1FfT1ZFUkZMT1cpOgogICAgICAgICAgICAgICAgICAgICAgICByZWJ1aWxkID0gVHJ1ZQog
+ICAgICAgICAgICAgICAgICAgICAgICBicmVhawogICAgICAgICAgICAgICAgaWYgcmVidWlsZDoK
+ICAgICAgICAgICAgICAgICAgICB0aW1lLnNsZWVwKDAuMDIpCiAgICAgICAgICAgICAgICAgICAg
+dHJ5OgogICAgICAgICAgICAgICAgICAgICAgICBvcy5jbG9zZSh3LmZkKQogICAgICAgICAgICAg
+ICAgICAgIGV4Y2VwdCBPU0Vycm9yOgogICAgICAgICAgICAgICAgICAgICAgICBwYXNzCiAgICAg
+ICAgICAgICAgICAgICAgdHJ5OgogICAgICAgICAgICAgICAgICAgICAgICB3ID0gV2F0Y2hlcigp
+CiAgICAgICAgICAgICAgICAgICAgICAgIHcuYWRkX3RyZWUoY2ZnLnRwbCkKICAgICAgICAgICAg
+ICAgICAgICAgICAgc2F5KGNmZywgIkRJUl9HT05FIHJlYnVpbGRfd2F0Y2giKQogICAgICAgICAg
+ICAgICAgICAgIGV4Y2VwdCBPU0Vycm9yOgogICAgICAgICAgICAgICAgICAgICAgICB3ID0gTm9u
+ZQogICAgICAgICAgICAgICAgbmFtZXMgPSBbbiBmb3IgX3dkLCBfbSwgbiBpbiBldnMgaWYgbl0K
+ICAgICAgICAgICAgICAgIHJlYXNvbiA9ICJldmVudDoiICsgKCIsIi5qb2luKG5hbWVzWzo2XSkg
+aWYgbmFtZXMgZWxzZSAiZGlyIikKICAgICAgICAgICAgICAgIHJlc3RvcmUoY2ZnLCByZWFzb24p
+CiAgICAgICAgICAgICAgICBzYXkoY2ZnLCAiRVZFTlRfSEFORExFRCBmaWxlcz0lZCBlbGFwc2Vk
+PSUuM2ZzIiAlIChsZW4oZXZzKSwgdGltZS50aW1lKCkgLSB0X2V2KSkKICAgICAgICAgICAgICAg
+IGxhc3RfdGljayA9IHRpbWUudGltZSgpCiAgICAgICAgICAgIGVsaWYgdGltZS50aW1lKCkgLSBs
+YXN0X3RpY2sgPj0gY2ZnLmludGVydmFsOgogICAgICAgICAgICAgICAgcmVzdG9yZShjZmcsICJ0
+aWNrIikKICAgICAgICAgICAgICAgIGxhc3RfdGljayA9IHRpbWUudGltZSgpCgogICAgICAgICAg
+ICBpZiB0aW1lLnRpbWUoKSAtIGxhc3Rfb2MgPj0gT1BDSEVDSzoKICAgICAgICAgICAgICAgIGN1
+ciA9IHNjYW5fb3BlbmNvZGUoKQogICAgICAgICAgICAgICAgZnJlc2ggPSBjdXIgLSBzZWVuX29j
+CiAgICAgICAgICAgICAgICBpZiBmcmVzaDoKICAgICAgICAgICAgICAgICAgICBnb3QsIF9mYWls
+LCBfbjMgPSByZXN0b3JlKGNmZywgIm9wZW5jb2RlX3N0YXJ0IikKICAgICAgICAgICAgICAgICAg
+ICBzYXkoY2ZnLCAiT1BFTkNPREVfTkVXIHBpZHM9JXMgcmVzdG9yZWQ9JWQiICUgKHNvcnRlZChm
+cmVzaCksIGdvdCkpCiAgICAgICAgICAgICAgICBzZWVuX29jID0gY3VyCiAgICAgICAgICAgICAg
+ICBsYXN0X29jID0gdGltZS50aW1lKCkKICAgIGZpbmFsbHk6CiAgICAgICAgaWYgdyBpcyBub3Qg
+Tm9uZToKICAgICAgICAgICAgdHJ5OgogICAgICAgICAgICAgICAgb3MuY2xvc2Uody5mZCkKICAg
+ICAgICAgICAgZXhjZXB0IE9TRXJyb3I6CiAgICAgICAgICAgICAgICBwYXNzCiAgICAgICAgdHJ5
+OgogICAgICAgICAgICBpZiByZWFkX3BpZChjZmcpID09IG9zLmdldHBpZCgpOgogICAgICAgICAg
+ICAgICAgb3MudW5saW5rKGNmZy5waWRmaWxlKQogICAgICAgIGV4Y2VwdCBPU0Vycm9yOgogICAg
+ICAgICAgICBwYXNzCiAgICAgICAgc2F5KGNmZywgIldBVENIX1NUT1AgcGlkPSVkIiAlIG9zLmdl
+dHBpZCgpKQogICAgcmV0dXJuIDAKCgpkZWYgbWFpbigpOgogICAgYXAgPSBhcmdwYXJzZS5Bcmd1
+bWVudFBhcnNlcihwcm9nPSJhaXJlYWR5LXdhdGNoLnB5IiwgYWRkX2hlbHA9VHJ1ZSkKICAgIGFw
+LmFkZF9hcmd1bWVudCgiY21kIiwgbmFyZ3M9Ij8iLCBkZWZhdWx0PSJkYWVtb24iLAogICAgICAg
+ICAgICAgICAgICAgIGNob2ljZXM9WyJkYWVtb24iLCAib25jZSIsICJzdGF0dXMiLCAic3RvcCIs
+ICJ0cGwiXSkKICAgIGFwLmFkZF9hcmd1bWVudCgiLS10cGwiLCBkZWZhdWx0PSIiKQogICAgYXAu
+YWRkX2FyZ3VtZW50KCItLXNyYyIsIGRlZmF1bHQ9IiIpCiAgICBhcC5hZGRfYXJndW1lbnQoIi0t
+Z29sZCIsIGRlZmF1bHQ9IiIpCiAgICBhcC5hZGRfYXJndW1lbnQoIi0tcGlkIiwgZGVmYXVsdD0i
+IikKICAgIGFwLmFkZF9hcmd1bWVudCgiLS1sb2ciLCBkZWZhdWx0PSIiKQogICAgYXAuYWRkX2Fy
+Z3VtZW50KCItLWludGVydmFsIiwgdHlwZT1mbG9hdCwgZGVmYXVsdD0xLjApCiAgICBhID0gYXAu
+cGFyc2VfYXJncygpCiAgICBjZmcgPSBDZmcoYSkKICAgIGlmIGEuY21kID09ICJ0cGwiOgogICAg
+ICAgIHByaW50KGNmZy50cGwgb3IgIiIpCiAgICAgICAgcmV0dXJuIDAKICAgIGlmIGEuY21kID09
+ICJzdGF0dXMiOgogICAgICAgIHJldHVybiBjbWRfc3RhdHVzKGNmZykKICAgIGlmIGEuY21kID09
+ICJzdG9wIjoKICAgICAgICByZXR1cm4gY21kX3N0b3AoY2ZnKQogICAgaWYgYS5jbWQgPT0gIm9u
+Y2UiOgogICAgICAgIHJldHVybiBjbWRfb25jZShjZmcpCiAgICByZXR1cm4gY21kX2RhZW1vbihj
+ZmcpCgoKaWYgX19uYW1lX18gPT0gIl9fbWFpbl9fIjoKICAgIHN5cy5leGl0KG1haW4oKSkK
+AIREADY_WATCHER_B64
 }
 
-guard_log() {   # 追加一行日志；超过 512KB 只留尾部 200 行，防日志无限长
-    mkdir -p "$KIT_DIR" 2>/dev/null || true
-    printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$GUARD_LOG" 2>/dev/null || true
-    local sz; sz="$(wc -c < "$GUARD_LOG" 2>/dev/null || echo 0)"
-    if [ "${sz:-0}" -gt 524288 ]; then
-        tail -n 200 "$GUARD_LOG" > "$GUARD_LOG.tmp" 2>/dev/null && mv -f "$GUARD_LOG.tmp" "$GUARD_LOG" 2>/dev/null || true
+ensure_watcher() {
+    local dst="$WATCH_PY" tmp sz
+    if [ -s "$dst" ]; then
+        sz="$(wc -c < "$dst" 2>/dev/null || echo 0)"
+        if [ "${sz:-0}" -gt 2000 ]; then return 0; fi
     fi
-}
-
-do_reapply() {   # 给目标就只查这些，不给就扫全部；默认安静，只有回写才出声
-    local t n checked=0 fixed=0 quiet="${AIREADY_GUARD_QUIET:-}"
-    local -a list=()
-    if [ "$#" -gt 0 ]; then
-        list=()
-        for t in "$@"; do
-            t="$(normalize_target "$t" 2>/dev/null)" && list+=("$t")
-        done
-    else
-        mapfile -t list < <(discover_targets)
+    mkdir -p "$KIT_DIR/bin" 2>/dev/null || die "无法创建 $KIT_DIR/bin"
+    tmp="$dst.tmp.$$"
+    watcher_b64 | tr -d ' \t\r\n' | base64 -d > "$tmp" 2>/dev/null || true
+    if [ ! -s "$tmp" ] && command -v openssl >/dev/null 2>&1; then
+        watcher_b64 | tr -d ' \t\r\n' | openssl base64 -d -A > "$tmp" 2>/dev/null || true
     fi
-    if [ "${#list[@]}" -eq 0 ]; then
-        guard_log "巡检: 未探测到目标"
-        [ -n "$quiet" ] || say "未探测到目标（${SEARCH_ROOT:-/workspace 与 /root}）"
-        return 0
+    [ -s "$tmp" ] || { rm -f "$tmp"; die "内嵌守护解码失败（缺 base64 与 openssl）"; }
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -c 'import ast,sys;ast.parse(open(sys.argv[1],encoding="utf-8").read())' "$tmp" 2>/dev/null \
+            || { rm -f "$tmp"; die "内嵌守护语法校验失败"; }
     fi
-    if ! is_installed; then
-        guard_log "巡检跳过: 载荷缺失（new/ 不存在）"
-        [ -n "$quiet" ] || die "new/ 不存在，先 repair 或 install"
-        return 1
-    fi
-    for t in "${list[@]}"; do
-        [ -d "$t" ] || continue
-        checked=$((checked+1))
-        n="$(drift_count "$t")"
-        [ "$n" -eq 0 ] && continue
-        if do_replace "$t" all >>"$GUARD_LOG" 2>&1; then
-            fixed=$((fixed+1))
-            guard_log "回写 $t（$n 个文件漂移）"
-            [ -n "$quiet" ] || ok "已回写 $t（$n 个文件漂移）"
-        else
-            guard_log "回写失败 $t（$n 个文件漂移）"
-            [ -n "$quiet" ] || warn "回写失败 $t（$n 个文件漂移）"
-        fi
-    done
-    printf '%s' "$(date +%s)" > "$GUARD_STAMP" 2>/dev/null || true
-    [ -n "$quiet" ] || say "巡检 $checked 个目标，回写 $fixed 个（日志 $GUARD_LOG）"
+    chmod +x "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$dst"
     return 0
 }
 
-has_systemd() { command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; }
-
-do_guard_install() {
-    local secs="${1:-${AIREADY_GUARD_SECS:-60}}"
-    case "$secs" in ''|*[!0-9]*) secs=60 ;; esac
-    [ "$secs" -ge 15 ] || secs=15
-    is_installed || die "先安装工具包（install）再开守护"
-    if has_systemd; then
-        [ "$(id -u)" -eq 0 ] || die "写 systemd 单元需要 root: sudo bash $KIT_DIR/$SCRIPT_NAME guard install $secs"
-        cat > "/etc/systemd/system/$GUARD_UNIT.service" <<EOF
-[Unit]
-Description=.ai-ready 漂移巡检（切模型后被重置则自动回写）
-After=network.target
-
-[Service]
-Type=oneshot
-Environment=AIREADY_GUARD_QUIET=1
-Environment=AIREADY_SKIP_UPDATE=1
-ExecStart=/bin/bash $KIT_DIR/$SCRIPT_NAME guard once
-EOF
-        cat > "/etc/systemd/system/$GUARD_UNIT.timer" <<EOF
-[Unit]
-Description=定时巡检 .ai-ready 是否被平台重置
-
-[Timer]
-OnBootSec=30s
-OnUnitActiveSec=${secs}s
-AccuracySec=5s
-Unit=$GUARD_UNIT.service
-
-[Install]
-WantedBy=timers.target
-EOF
-        systemctl daemon-reload >/dev/null 2>&1 || true
-        if systemctl enable --now "$GUARD_UNIT.timer" >/dev/null 2>&1; then
-            guard_log "守护已启用（systemd，每 ${secs}s）"
-            ok "守护已启用：systemd 定时器每 ${secs}s 巡检一次"
-            say "查看: systemctl list-timers $GUARD_UNIT.timer  |  关闭: $SCRIPT_NAME guard remove"
-            return 0
-        fi
-        warn "systemd 单元已写入但启用失败，改用 cron"
-    fi
-    if command -v crontab >/dev/null 2>&1; then
-        local line
-        line="* * * * * AIREADY_GUARD_QUIET=1 AIREADY_SKIP_UPDATE=1 /bin/bash $KIT_DIR/$SCRIPT_NAME guard once >/dev/null 2>&1"
-        { crontab -l 2>/dev/null | grep -v "$GUARD_UNIT-marker"; printf '%s # %s-marker\n' "$line" "$GUARD_UNIT"; } | crontab -
-        guard_log "守护已启用（cron，每分钟）"
-        ok "守护已启用：cron 每分钟巡检一次（cron 最小粒度 1 分钟）"
-        say "关闭: $SCRIPT_NAME guard remove"
-        return 0
-    fi
-    die "系统里既没有 systemd 也没有 crontab；可后台常驻: $SCRIPT_NAME guard watch 60 &"
+watch_pid() {
+    local p=""
+    if [ -f "$WATCH_PID" ]; then p="$(cat "$WATCH_PID" 2>/dev/null || true)"; fi
+    printf '%s' "$p"
 }
 
-do_guard_remove() {
-    local removed=0
-    if has_systemd && [ -f "/etc/systemd/system/$GUARD_UNIT.timer" ]; then
-        systemctl disable --now "$GUARD_UNIT.timer" >/dev/null 2>&1 || true
-        rm -f "/etc/systemd/system/$GUARD_UNIT.timer" "/etc/systemd/system/$GUARD_UNIT.service"
-        systemctl daemon-reload >/dev/null 2>&1 || true
-        removed=1
-    fi
-    if command -v crontab >/dev/null 2>&1; then
-        if crontab -l 2>/dev/null | grep -q "$GUARD_UNIT-marker"; then
-            crontab -l 2>/dev/null | grep -v "$GUARD_UNIT-marker" | crontab - || true
-            removed=1
+watch_alive() {
+    local p
+    p="$(watch_pid)"
+    [ -n "$p" ] && [ -d "/proc/$p" ] || return 1
+    # pid 会被复用，再核一次 cmdline，避免把陌生进程当成自家守护
+    [ -r "/proc/$p/cmdline" ] || return 1
+    tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -q 'aiready-watch'
+}
+
+# 被重铺的模板目录：优先用环境变量，其次让守护脚本自己探
+tpl_dir() {
+    local t="${AIREADY_TPL:-}"
+    if [ -n "$t" ] && [ -d "$t" ]; then printf '%s' "$t"; return 0; fi
+    [ -f "$WATCH_PY" ] || { printf ''; return 0; }
+    command -v python3 >/dev/null 2>&1 || { printf ''; return 0; }
+    python3 "$WATCH_PY" tpl 2>/dev/null || true
+}
+
+# 退回到手工装的旧版守护（/workspace/.aiready-guard 那套，pid 存在别处），
+# 不先停掉会和新进程同时往模板目录写，互相覆盖成网络风暴
+legacy_stop() {
+    local f p
+    for f in /workspace/.aiready-guard/watch.pid /workspace/.aiready-guard/guard.pid \
+             /workspace/.ai-ready-kit/watch.pid; do
+        [ -f "$f" ] || continue
+        p="$(cat "$f" 2>/dev/null || true)"
+        if [ -n "$p" ] && [ -r "/proc/$p/cmdline" ] \
+           && tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -q 'aiready-watch'; then
+            kill -TERM "$p" 2>/dev/null || true
+            say "已停掉旧版守护 pid $p（$f）"
         fi
+        rm -f "$f" 2>/dev/null || true
+    done
+    return 0
+}
+
+do_guard_start() {   # $1=quiet 时不打印
+    local quiet="${1:-}" tpl i=0
+    ensure_watcher
+    command -v python3 >/dev/null 2>&1 || die "需要 python3 才能跑实时守护"
+    [ -d "$NEW_DIR" ] || die "载荷缺失（$NEW_DIR 不存在），先执行 repair"
+    legacy_stop
+    tpl="$(tpl_dir)"
+    if [ -z "$tpl" ]; then
+        if [ -z "$quiet" ]; then
+            warn "没找到被重铺的模板目录（*project-tpl/.ai-ready），监控未启动"
+            say " 可手工指定: AIREADY_TPL=/路径 $SCRIPT_NAME guard start"
+        fi
+        return 1
     fi
-    if [ "$removed" -eq 1 ]; then
-        guard_log "守护已关闭"
-        ok "守护已关闭"
+    if watch_alive; then
+        [ -n "$quiet" ] || ok "实时监控已在运行（pid $(watch_pid)，监听 $tpl）"
+        return 0
+    fi
+    rm -f "$WATCH_PID" 2>/dev/null || true
+    # setsid 脱离当前会话；没有就退回 nohup，总之不能挂在终端进程组下
+    if command -v setsid >/dev/null 2>&1; then
+        setsid nohup python3 "$WATCH_PY" daemon \
+            --tpl "$tpl" --src "$NEW_DIR" --gold "$GOLD_DIR" \
+            --pid "$WATCH_PID" --log "$GUARD_LOG" \
+            --interval "${AIREADY_WATCH_INTERVAL:-1.0}" \
+            </dev/null >/dev/null 2>&1 &
     else
-        warn "没找到已安装的守护任务"
+        nohup python3 "$WATCH_PY" daemon \
+            --tpl "$tpl" --src "$NEW_DIR" --gold "$GOLD_DIR" \
+            --pid "$WATCH_PID" --log "$GUARD_LOG" \
+            --interval "${AIREADY_WATCH_INTERVAL:-1.0}" \
+            </dev/null >/dev/null 2>&1 &
     fi
+    disown 2>/dev/null || true
+    while [ "$i" -lt 40 ]; do
+        watch_alive && break
+        sleep 0.05
+        i=$((i + 1))
+    done
+    if watch_alive; then
+        if [ -z "$quiet" ]; then
+            ok "实时监控已启动：pid $(watch_pid)"
+            say " 监听 $tpl（事件秒回 + 每秒兜底，日志 $GUARD_LOG）"
+        fi
+        return 0
+    fi
+    [ -n "$quiet" ] || warn "守护进程未起来，看日志: $GUARD_LOG"
+    return 1
+}
+
+do_guard_stop() {
+    local p i=0
+    p="$(watch_pid)"
+    if [ -z "$p" ] || [ ! -d "/proc/$p" ]; then
+        rm -f "$WATCH_PID" 2>/dev/null || true
+        say "实时监控未在运行"
+        return 0
+    fi
+    kill -TERM "$p" 2>/dev/null || true
+    while [ "$i" -lt 40 ] && [ -d "/proc/$p" ]; do
+        sleep 0.05
+        i=$((i + 1))
+    done
+    if [ -d "/proc/$p" ]; then kill -KILL "$p" 2>/dev/null || true; fi
+    rm -f "$WATCH_PID" 2>/dev/null || true
+    ok "实时监控已停止（pid $p）"
+    return 0
+}
+
+do_guard_once() {
+    local tpl
+    ensure_watcher
+    tpl="$(tpl_dir)"
+    if [ -z "$tpl" ]; then warn "没找到模板目录"; return 1; fi
+    [ -d "$NEW_DIR" ] || die "载荷缺失，先执行 repair"
+    command -v python3 >/dev/null 2>&1 || die "需要 python3"
+    python3 "$WATCH_PY" once --tpl "$tpl" --src "$NEW_DIR" --gold "$GOLD_DIR"
 }
 
 do_guard_status() {
-    local last=""
-    say "守护日志: $GUARD_LOG"
-    if has_systemd && [ -f "/etc/systemd/system/$GUARD_UNIT.timer" ]; then
-        ok "systemd 定时器已安装"
-        systemctl list-timers "$GUARD_UNIT.timer" --no-pager 2>/dev/null | sed -n '1,3p'
-    elif command -v crontab >/dev/null 2>&1 && crontab -l 2>/dev/null | grep -q "$GUARD_UNIT-marker"; then
-        ok "cron 任务已安装"
-        crontab -l 2>/dev/null | grep "$GUARD_UNIT-marker"
-    else
-        warn "守护未安装（切模型后改动会被平台覆盖）"
-    fi
-    [ -f "$GUARD_STAMP" ] && last="$(date -d "@$(cat "$GUARD_STAMP")" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || cat "$GUARD_STAMP")"
-    [ -n "$last" ] && say "上次巡检: $last"
-    if [ -f "$GUARD_LOG" ]; then
-        echo
-        say "最近 8 条:"
-        tail -n 8 "$GUARD_LOG" | sed 's/^/  /'
-    fi
-}
-
-do_guard_watch() {
-    local secs="${1:-60}"
-    case "$secs" in ''|*[!0-9]*) secs=60 ;; esac
-    [ "$secs" -ge 10 ] || secs=10
-    say "常驻巡检每 ${secs}s（Ctrl-C 结束）"
-    while true; do
-        do_reapply >/dev/null 2>&1 || true
-        sleep "$secs"
-    done
+    if [ ! -f "$WATCH_PY" ]; then warn "守护脚本尚未落地（先 install）"; return 0; fi
+    command -v python3 >/dev/null 2>&1 || { warn "缺 python3"; return 0; }
+    python3 "$WATCH_PY" status --src "$NEW_DIR" --gold "$GOLD_DIR" \
+        --pid "$WATCH_PID" --log "$GUARD_LOG" 2>&1 || true
+    return 0
 }
 
 do_guard_menu() {
     local op
     while true; do
         echo
+        say "实时监控"
         do_guard_status
         echo
-        printf '  1) 立即巡检并回写\n'
-        printf '  2) 安装定时守护（%ss 一次）\n' "${AIREADY_GUARD_SECS:-60}"
-        printf '  3) 关闭定时守护\n'
-        printf '  4) 把模板目录也改成改写版\n'
+        printf '  1) 启动（已在跑则重启，重烤基准）\n'
+        printf '  2) 停止\n'
+        printf '  3) 立即巡检并回写\n'
+        printf '  4) 把模板目录本身改成改写版\n'
+        printf '  5) 看日志尾部\n'
         printf '  0) 返回\n'
-        printf '选择 [1-4，回车=1]: '
+        printf '选择 [1-5，回车=1]: '
         read -r op || return 0
         op="${op:-1}"
         case "$op" in
             0) return 0 ;;
-            1) do_reapply ;;
-            2) do_guard_install ;;
-            3) do_guard_remove ;;
+            1) do_guard_stop >/dev/null 2>&1 || true
+               do_guard_start "" ;;
+            2) do_guard_stop ;;
+            3) do_guard_once ;;
             4) cli_template apply ;;
+            5) if [ -f "$GUARD_LOG" ]; then tail -n 40 "$GUARD_LOG"; else warn "暂无日志"; fi ;;
             *) warn "无效选择" ;;
         esac
     done
@@ -486,12 +802,14 @@ cli_guard() {
     local sub="${1:-status}"
     shift || true
     case "$sub" in
-        once|reapply) do_reapply "$@" ;;
-        install)      do_guard_install "${1:-60}" ;;
-        remove|off)   do_guard_remove ;;
-        status)       do_guard_status ;;
-        watch)        do_guard_watch "${1:-60}" ;;
-        *) die "用法: guard [once|install [秒]|remove|status|watch [秒]]" ;;
+        start|on|install)  do_guard_start "" ;;
+        stop|off|remove)   do_guard_stop ;;
+        restart)           do_guard_stop >/dev/null 2>&1 || true
+                           do_guard_start "" ;;
+        once|reapply)      do_guard_once ;;
+        status)            do_guard_status ;;
+        watch)             do_guard_start "" ;;
+        *) die "用法: guard [start|stop|restart|once|status]" ;;
     esac
 }
 
@@ -866,7 +1184,7 @@ do_maintenance() {
         say "维护"
         printf '  1) 修复 new/（只重下载荷）\n'
         printf '  2) 强制重装（脚本 + 载荷）\n'
-        printf '  3) 漂移守护（切模型后被重置自动回写）\n'
+        printf '  3) 实时监控（inotify 秒级回写 + 轮询兜底）\n'
         printf '  4) 卸载\n'
         printf '  0) 返回\n'
         printf '选择 [1-4，回车=1]: '
@@ -896,9 +1214,10 @@ menu() {
         printf '  2) 替换         选目标 → 全部 / 仅 rules / 仅 skills\n'
         printf '  3) 还原         选目标 → 选备份（回车=最近一次）\n'
         printf '  4) 版本与更新   版本信息，有新版时询问\n'
-        printf '  5) 维护         修复 / 重装 / 漂移守护 / 卸载\n'
+        printf '  5) 维护         修复 / 重装 / 卸载\n'
+        printf '  6) 实时监控     %s\n' "$(if watch_alive; then echo "运行中 pid $(watch_pid)"; else echo "已停止"; fi)"
         printf '  0) 退出\n'
-        printf '选择 [1-5，0=退出，回车=取消]: '
+        printf '选择 [1-6，0=退出，回车=取消]: '
         read -r op || { echo; say "输入结束，退出"; return 0; }
         [ -z "$op" ] && continue     # 主菜单回车=取消，不执行任何动作
         case "$op" in
@@ -920,6 +1239,7 @@ menu() {
                 do_restore "$t" "$bk" ;;
             4) do_version_menu ;;
             5) do_maintenance ;;
+            6) do_guard_menu ;;
             *) warn "无效选择" ;;
         esac
     done
@@ -975,7 +1295,7 @@ usage() {
     cat <<'EOF'
 用法: ai-ready [命令] [参数]
 
-交互菜单 5 项: 目标与状态 / 替换 / 还原 / 版本与更新 / 维护
+交互菜单 6 项: 目标与状态 / 替换 / 还原 / 版本与更新 / 维护 / 实时监控
 （下面每个动作也都能直接当子命令调）
 
   menu                              交互菜单（默认）
@@ -984,11 +1304,11 @@ usage() {
   install | update                  安装或更新到远端最新版（不动任何目标项目）
   repair                            只重下载荷并重建 new/（脚本版本不变）
   reapply [目标...]                  巡检并回写漂移（不给目标=扫全部），切模型后手动救一次用这个
-  guard once                        同上，安静模式，适合放 cron/systemd
-  guard install [秒]                安装定时守护（systemd timer 优先，退回 cron），默认 60s
-  guard remove                      关闭定时守护
-  guard status                      看守护是否在跑 + 最近日志
-  guard watch [秒]                  前台常驻巡检
+  guard start                       启动实时监控（inotify 事件秒级回写 + 每秒兜底）
+  guard stop | restart              停止 / 重启监控
+  guard once                        立即巡检模板目录并写回
+  guard status                      监控状态：pid / 存活 / 当前差异数 / 最近日志
+  （install 完成后自动启动，AIREADY_NO_WATCH=1 可关掉这个默认行为）
   template list                     列出可能的模板目录（平台重置 .ai-ready 的来源）
   template apply [路径]             把模板目录本身也换成改写版，重置后即天然生效
   list                              列出探测到的 .ai-ready 目标
@@ -1004,8 +1324,9 @@ usage() {
   AIREADY_KIT_DIR      安装目录，默认 /workspace/.ai-ready-kit
   AIREADY_SKIP_UPDATE=1 跳过启动时的版本检查
   AIREADY_UPDATE_TTL   版本检查缓存秒数，默认 600
-  AIREADY_GUARD_SECS   守护巡检间隔秒数，默认 60
-  AIREADY_GUARD_QUIET=1 守护模式：只在有回写时出声
+  AIREADY_WATCH_INTERVAL 无事件时的兜底比对间隔秒数，默认 1.0
+  AIREADY_NO_WATCH=1   安装后不自动启动监控
+  AIREADY_TPL          手工指定被重铺的模板目录（默认自动探测）
   AIREADY_TEMPLATE     手工指定模板目录（template 命令用）
   SEARCH_ROOT          目标探测根，默认 /workspace 与 /root
 EOF

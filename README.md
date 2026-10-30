@@ -60,21 +60,24 @@ AIREADY_SKIP_UPDATE=1 ai-ready
 
 ## 三、菜单
 
-主菜单 5 项，每个动作下面再选一次具体参数：
+主菜单 6 项，每个动作下面再选一次具体参数：
 
 ```
-===== .ai-ready 工具包 v2026103007 =====
-已装 v2026103007   目标 2 个
+===== .ai-ready 工具包 v2026103009 =====
+已装 v2026103009   目标 2 个
 
   1) 目标与状态   列目标 + 一致性，可展开差异
   2) 替换         选目标 → 全部 / 仅 rules / 仅 skills
   3) 还原         选目标 → 选备份（回车=最近一次）
   4) 版本与更新   版本信息，有新版时询问
   5) 维护         修复 / 重装 / 卸载
+  6) 实时监控     运行中 pid 14591
   0) 退出
 
-选择 [1-5，0=退出，回车=取消]:
+选择 [1-6，0=退出，回车=取消]:
 ```
+
+第 6 项实时显示监控状态，进去是 启动 / 停止 / 立即巡检 / 改模板 / 看日志。
 
 **回车语义**：主菜单回车＝取消（不执行任何动作，直接重画菜单）；进了某一路之后，
 每个子提示回车都取第一个选项，确认提示回车＝`y`：
@@ -211,20 +214,41 @@ CDN 的分支引用有缓存，可能几小时内一直吐旧文件。脚本对�
 
 ---
 
-## 八、漂移守护（切模型后被重置）
+## 八、实时监控（切模型后被重置）
 
-平台在「创建任务 / 重启会话 / 切换模型」时会重放 agent 资源，`~/.codingmatrix/project-tpl/.ai-ready/` 下的 rules 可能被平台写回原始版。守护做的事很简单：周期性比对目标与 `new/`，有漂移就按 `new/` 回写（回写前照例快照）。
+平台在「创建任务 / 重启会话 / 切换模型」时会重放 agent 资源，`~/.codingmatrix/project-tpl/.ai-ready/` 下的 rules 被重铺成原始版——手法固定为 `create .xxx.tmp.<随机数>` → `rename`。
+
+监控直接盯那个目录，三层从快到慢：
+
+| 层 | 触发 | 延迟 |
+|---|---|---|
+| inotify 事件 | `CLOSE_WRITE` / `MOVED_TO` / `CREATE` / `DELETE` | 毫秒级，实测 0.05s 内写回 |
+| 静默合并 | 同批事件停 60ms 收齐，只比对一次 | 避免 20 个文件触发 20 轮扫描 |
+| 轮询兜底 | 无事件时每 1s 全量比对（26 文件，微秒级） | 覆盖丢事件 / 队列溢出 / 目录被整棵换掉 |
+
+另加一个 **opencode 进程检测**：`/proc/*/comm` 出现新的 `opencode` pid 时立刻比对一次，堵住「重铺 → 重启」之间的窗口。切模型时两层经常接上：事件层先修完，进程启动时 `DIFF_NOW=0`，什么都不用做。
+
+**装完即守**，不需要额外执行任何命令：
 
 ```bash
-ai-ready guard install 60     # 装 systemd timer（没有 systemd 就退回 cron），每 60s 巡检
-ai-ready guard status         # 是否在跑 + 最近 8 条日志
-ai-ready guard remove         # 关掉
-ai-ready guard once           # 手动巡检一次（安静模式，适合放 cron）
-ai-ready reapply              # 同上，带输出，切完模型手动救一次用这个
-ai-ready template list        # 列出可能的模板目录（重置来源）
-ai-ready template apply       # 把模板目录本身也换成改写版
+curl -fsSL https://raw.githubusercontent.com/qq928820655/ai-ready-kit/main/toggle-ai-ready.sh | sh
 ```
 
-日志在 `$KIT_DIR/guard.log`（超过 512KB 自动截尾）。菜单入口：`5) 维护 → 3) 漂移守护`。
+安装流程走到最后一步会自动拉起守护进程（`AIREADY_NO_WATCH=1` 可关掉这个默认行为）。之后：
 
-`template apply` 的意义：如果重置是把某个 `*project-tpl*` 目录重新铺一遍，把模板本身改掉之后，重置结果天然就是改写版，守护只剩兜底。
+```bash
+ai-ready guard start          # 启动（已在跑则重启，同时重烤基准）
+ai-ready guard stop           # 停止
+ai-ready guard restart        # 重启
+ai-ready guard once           # 立即巡检模板目录并写回
+ai-ready guard status         # pid / 存活 / 当前差异数 / 最近日志
+ai-ready reapply              # 另一回事：巡检「目标项目」的 .ai-ready 并回写
+```
+
+菜单入口：`6) 实时监控`（启动 / 停止 / 立即巡检 / 改模板 / 看日志）。
+
+守护脚本以 base64 内嵌在 `toggle-ai-ready.sh` 里，安装时解码落到 `$KIT_DIR/bin/aiready-watch.py` 并做 AST 校验。所以 `curl` 单文件就能装完，不依赖仓库里的第二个文件，也不会因为 raw 域名限流装到一半。
+
+日志在 `$KIT_DIR/watch.log`（超 512KB 自动截尾），基准副本在 `$KIT_DIR/.gold`。
+
+`template apply` 的意义：如果重置是把某个 `*project-tpl*` 目录重新铺一遍，把模板本身改掉之后，重置结果天然就是改写版，监控只剩兜底。

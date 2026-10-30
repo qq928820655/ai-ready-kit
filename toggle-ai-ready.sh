@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # toggle-ai-ready.sh — .ai-ready 规则一键替换 / 一键还原
-# version: 2026103007
+# version: 2026103008
 #
 # 托管：仓库里放两个文件（脚本 + 载荷包），服务器上一条命令安装:
 #   curl -fsSL <URL_BASE>/toggle-ai-ready.sh | sh              # 安装 → 进菜单
@@ -74,7 +74,7 @@ URL_BASE="${AIREADY_URL_BASE:-$DEFAULT_BASE}"
 BASE_CACHE="$KIT_DIR/.base"
 SCRIPT_NAME="toggle-ai-ready.sh"
 PAYLOAD_NAME="ai-ready-payload.tar.gz"
-VERSION="2026103007"
+VERSION="2026103008"
 UPDATE_TTL="${AIREADY_UPDATE_TTL:-600}"
 
 C_G='\033[32m'; C_Y='\033[33m'; C_R='\033[31m'; C_B='\033[36m'; C_0='\033[0m'
@@ -280,6 +280,262 @@ do_uninstall() {
     ok "已卸载组件（/usr/local/bin/ai-ready 符号链接一并移除）"
     say "彻底删除目录: rm -rf $KIT_DIR"
     exit 0
+}
+
+# ---------- 漂移守护 ----------
+# 切换模型 / 重开项目时，平台会把项目模板里的 .ai-ready 重新铺一遍，本地改动被覆盖。
+# 守护进程周期性比对目标与 new/，发现漂移就按 new/ 回写（回写前照例快照，可还原）。
+
+GUARD_LOG="$KIT_DIR/guard.log"
+GUARD_STAMP="$KIT_DIR/.guard.last"
+GUARD_UNIT="ai-ready-guard"
+
+drift_count() {   # $1=目标，输出与 new/ 不一致或缺失的文件数
+    local t="$1" f rel n=0
+    [ -d "$NEW_DIR" ] || { printf '0'; return 0; }
+    while IFS= read -r f; do
+        rel="${f#"$NEW_DIR/"}"
+        if [ ! -f "$t/$rel" ] || ! cmp -s "$f" "$t/$rel"; then n=$((n+1)); fi
+    done < <(find "$NEW_DIR" -type f 2>/dev/null)
+    printf '%s' "$n"
+}
+
+guard_log() {   # 追加一行日志；超过 512KB 只留尾部 200 行，防日志无限长
+    mkdir -p "$KIT_DIR" 2>/dev/null || true
+    printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$GUARD_LOG" 2>/dev/null || true
+    local sz; sz="$(wc -c < "$GUARD_LOG" 2>/dev/null || echo 0)"
+    if [ "${sz:-0}" -gt 524288 ]; then
+        tail -n 200 "$GUARD_LOG" > "$GUARD_LOG.tmp" 2>/dev/null && mv -f "$GUARD_LOG.tmp" "$GUARD_LOG" 2>/dev/null || true
+    fi
+}
+
+do_reapply() {   # 给目标就只查这些，不给就扫全部；默认安静，只有回写才出声
+    local t n checked=0 fixed=0 quiet="${AIREADY_GUARD_QUIET:-}"
+    local -a list=()
+    if [ "$#" -gt 0 ]; then
+        list=()
+        for t in "$@"; do
+            t="$(normalize_target "$t" 2>/dev/null)" && list+=("$t")
+        done
+    else
+        mapfile -t list < <(discover_targets)
+    fi
+    if [ "${#list[@]}" -eq 0 ]; then
+        guard_log "巡检: 未探测到目标"
+        [ -n "$quiet" ] || say "未探测到目标（${SEARCH_ROOT:-/workspace 与 /root}）"
+        return 0
+    fi
+    if ! is_installed; then
+        guard_log "巡检跳过: 载荷缺失（new/ 不存在）"
+        [ -n "$quiet" ] || die "new/ 不存在，先 repair 或 install"
+        return 1
+    fi
+    for t in "${list[@]}"; do
+        [ -d "$t" ] || continue
+        checked=$((checked+1))
+        n="$(drift_count "$t")"
+        [ "$n" -eq 0 ] && continue
+        if do_replace "$t" all >>"$GUARD_LOG" 2>&1; then
+            fixed=$((fixed+1))
+            guard_log "回写 $t（$n 个文件漂移）"
+            [ -n "$quiet" ] || ok "已回写 $t（$n 个文件漂移）"
+        else
+            guard_log "回写失败 $t（$n 个文件漂移）"
+            [ -n "$quiet" ] || warn "回写失败 $t（$n 个文件漂移）"
+        fi
+    done
+    printf '%s' "$(date +%s)" > "$GUARD_STAMP" 2>/dev/null || true
+    [ -n "$quiet" ] || say "巡检 $checked 个目标，回写 $fixed 个（日志 $GUARD_LOG）"
+    return 0
+}
+
+has_systemd() { command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; }
+
+do_guard_install() {
+    local secs="${1:-${AIREADY_GUARD_SECS:-60}}"
+    case "$secs" in ''|*[!0-9]*) secs=60 ;; esac
+    [ "$secs" -ge 15 ] || secs=15
+    is_installed || die "先安装工具包（install）再开守护"
+    if has_systemd; then
+        [ "$(id -u)" -eq 0 ] || die "写 systemd 单元需要 root: sudo bash $KIT_DIR/$SCRIPT_NAME guard install $secs"
+        cat > "/etc/systemd/system/$GUARD_UNIT.service" <<EOF
+[Unit]
+Description=.ai-ready 漂移巡检（切模型后被重置则自动回写）
+After=network.target
+
+[Service]
+Type=oneshot
+Environment=AIREADY_GUARD_QUIET=1
+Environment=AIREADY_SKIP_UPDATE=1
+ExecStart=/bin/bash $KIT_DIR/$SCRIPT_NAME guard once
+EOF
+        cat > "/etc/systemd/system/$GUARD_UNIT.timer" <<EOF
+[Unit]
+Description=定时巡检 .ai-ready 是否被平台重置
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=${secs}s
+AccuracySec=5s
+Unit=$GUARD_UNIT.service
+
+[Install]
+WantedBy=timers.target
+EOF
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        if systemctl enable --now "$GUARD_UNIT.timer" >/dev/null 2>&1; then
+            guard_log "守护已启用（systemd，每 ${secs}s）"
+            ok "守护已启用：systemd 定时器每 ${secs}s 巡检一次"
+            say "查看: systemctl list-timers $GUARD_UNIT.timer  |  关闭: $SCRIPT_NAME guard remove"
+            return 0
+        fi
+        warn "systemd 单元已写入但启用失败，改用 cron"
+    fi
+    if command -v crontab >/dev/null 2>&1; then
+        local line
+        line="* * * * * AIREADY_GUARD_QUIET=1 AIREADY_SKIP_UPDATE=1 /bin/bash $KIT_DIR/$SCRIPT_NAME guard once >/dev/null 2>&1"
+        { crontab -l 2>/dev/null | grep -v "$GUARD_UNIT-marker"; printf '%s # %s-marker\n' "$line" "$GUARD_UNIT"; } | crontab -
+        guard_log "守护已启用（cron，每分钟）"
+        ok "守护已启用：cron 每分钟巡检一次（cron 最小粒度 1 分钟）"
+        say "关闭: $SCRIPT_NAME guard remove"
+        return 0
+    fi
+    die "系统里既没有 systemd 也没有 crontab；可后台常驻: $SCRIPT_NAME guard watch 60 &"
+}
+
+do_guard_remove() {
+    local removed=0
+    if has_systemd && [ -f "/etc/systemd/system/$GUARD_UNIT.timer" ]; then
+        systemctl disable --now "$GUARD_UNIT.timer" >/dev/null 2>&1 || true
+        rm -f "/etc/systemd/system/$GUARD_UNIT.timer" "/etc/systemd/system/$GUARD_UNIT.service"
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        removed=1
+    fi
+    if command -v crontab >/dev/null 2>&1; then
+        if crontab -l 2>/dev/null | grep -q "$GUARD_UNIT-marker"; then
+            crontab -l 2>/dev/null | grep -v "$GUARD_UNIT-marker" | crontab - || true
+            removed=1
+        fi
+    fi
+    if [ "$removed" -eq 1 ]; then
+        guard_log "守护已关闭"
+        ok "守护已关闭"
+    else
+        warn "没找到已安装的守护任务"
+    fi
+}
+
+do_guard_status() {
+    local last=""
+    say "守护日志: $GUARD_LOG"
+    if has_systemd && [ -f "/etc/systemd/system/$GUARD_UNIT.timer" ]; then
+        ok "systemd 定时器已安装"
+        systemctl list-timers "$GUARD_UNIT.timer" --no-pager 2>/dev/null | sed -n '1,3p'
+    elif command -v crontab >/dev/null 2>&1 && crontab -l 2>/dev/null | grep -q "$GUARD_UNIT-marker"; then
+        ok "cron 任务已安装"
+        crontab -l 2>/dev/null | grep "$GUARD_UNIT-marker"
+    else
+        warn "守护未安装（切模型后改动会被平台覆盖）"
+    fi
+    [ -f "$GUARD_STAMP" ] && last="$(date -d "@$(cat "$GUARD_STAMP")" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || cat "$GUARD_STAMP")"
+    [ -n "$last" ] && say "上次巡检: $last"
+    if [ -f "$GUARD_LOG" ]; then
+        echo
+        say "最近 8 条:"
+        tail -n 8 "$GUARD_LOG" | sed 's/^/  /'
+    fi
+}
+
+do_guard_watch() {
+    local secs="${1:-60}"
+    case "$secs" in ''|*[!0-9]*) secs=60 ;; esac
+    [ "$secs" -ge 10 ] || secs=10
+    say "常驻巡检每 ${secs}s（Ctrl-C 结束）"
+    while true; do
+        do_reapply >/dev/null 2>&1 || true
+        sleep "$secs"
+    done
+}
+
+do_guard_menu() {
+    local op
+    while true; do
+        echo
+        do_guard_status
+        echo
+        printf '  1) 立即巡检并回写\n'
+        printf '  2) 安装定时守护（%ss 一次）\n' "${AIREADY_GUARD_SECS:-60}"
+        printf '  3) 关闭定时守护\n'
+        printf '  4) 把模板目录也改成改写版\n'
+        printf '  0) 返回\n'
+        printf '选择 [1-4，回车=1]: '
+        read -r op || return 0
+        op="${op:-1}"
+        case "$op" in
+            0) return 0 ;;
+            1) do_reapply ;;
+            2) do_guard_install ;;
+            3) do_guard_remove ;;
+            4) cli_template apply ;;
+            *) warn "无效选择" ;;
+        esac
+    done
+}
+
+cli_guard() {
+    local sub="${1:-status}"
+    shift || true
+    case "$sub" in
+        once|reapply) do_reapply "$@" ;;
+        install)      do_guard_install "${1:-60}" ;;
+        remove|off)   do_guard_remove ;;
+        status)       do_guard_status ;;
+        watch)        do_guard_watch "${1:-60}" ;;
+        *) die "用法: guard [once|install [秒]|remove|status|watch [秒]]" ;;
+    esac
+}
+
+# ---------- 模板层 ----------
+# 若重置来自本机模板目录（平台每次铺 .ai-ready 的源），把模板本身也换掉，
+# 重置就天然是改写版，守护只剩兜底。
+
+find_template_dirs() {
+    local r roots
+    [ -n "${AIREADY_TEMPLATE:-}" ] && [ -d "$AIREADY_TEMPLATE" ] && printf '%s\n' "$AIREADY_TEMPLATE"
+    roots="${SEARCH_ROOT:-/workspace /root}"
+    for r in $roots; do
+        [ -d "$r" ] || continue
+        find "$r" -maxdepth 5 -type d -name '*project-tpl*' -not -path '*/node_modules/*' 2>/dev/null
+    done | while IFS= read -r d; do
+        if [ -d "$d/.ai-ready/rules" ] || [ -d "$d/.ai-ready/skills" ]; then printf '%s\n' "$d/.ai-ready"
+        elif [ -d "$d/rules" ] || [ -d "$d/skills" ]; then printf '%s\n' "$d"; fi
+    done | awk '!seen[$0]++'
+}
+
+cli_template() {
+    local sub="${1:-list}" d n=0
+    shift || true
+    case "$sub" in
+        list)
+            say "模板候选（重置来源）:"
+            while IFS= read -r d; do printf '  %s\n' "$d"; n=$((n+1)); done < <(find_template_dirs)
+            if [ "$n" -eq 0 ]; then warn "没找到 *project-tpl* 目录；用 AIREADY_TEMPLATE=/路径 指定"; fi
+            return 0
+            ;;
+        apply)
+            if [ "$#" -gt 0 ]; then
+                do_replace "$1" all
+                return 0
+            fi
+            while IFS= read -r d; do
+                say "模板 → $d"
+                do_replace "$d" all || warn "跳过 $d"
+                n=$((n+1))
+            done < <(find_template_dirs)
+            [ "$n" -gt 0 ] || die "没找到模板目录；用 template apply /路径 指定"
+            ;;
+        *) die "用法: template [list|apply [路径]]" ;;
+    esac
 }
 
 # ---------- 目标探测 ----------
@@ -610,16 +866,18 @@ do_maintenance() {
         say "维护"
         printf '  1) 修复 new/（只重下载荷）\n'
         printf '  2) 强制重装（脚本 + 载荷）\n'
-        printf '  3) 卸载\n'
+        printf '  3) 漂移守护（切模型后被重置自动回写）\n'
+        printf '  4) 卸载\n'
         printf '  0) 返回\n'
-        printf '选择 [1-3，回车=1]: '
+        printf '选择 [1-4，回车=1]: '
         read -r op || return 0
         op="${op:-1}"
         case "$op" in
             0) return 0 ;;
             1) do_repair ;;
             2) do_install ;;
-            3) do_uninstall ;;
+            3) do_guard_menu ;;
+            4) do_uninstall ;;
             *) warn "无效选择" ;;
         esac
     done
@@ -638,7 +896,7 @@ menu() {
         printf '  2) 替换         选目标 → 全部 / 仅 rules / 仅 skills\n'
         printf '  3) 还原         选目标 → 选备份（回车=最近一次）\n'
         printf '  4) 版本与更新   版本信息，有新版时询问\n'
-        printf '  5) 维护         修复 / 重装 / 卸载\n'
+        printf '  5) 维护         修复 / 重装 / 漂移守护 / 卸载\n'
         printf '  0) 退出\n'
         printf '选择 [1-5，0=退出，回车=取消]: '
         read -r op || { echo; say "输入结束，退出"; return 0; }
@@ -725,6 +983,14 @@ usage() {
   check                             只检查远端版本（0=有新版 1=已最新 2=连不上）
   install | update                  安装或更新到远端最新版（不动任何目标项目）
   repair                            只重下载荷并重建 new/（脚本版本不变）
+  reapply [目标...]                  巡检并回写漂移（不给目标=扫全部），切模型后手动救一次用这个
+  guard once                        同上，安静模式，适合放 cron/systemd
+  guard install [秒]                安装定时守护（systemd timer 优先，退回 cron），默认 60s
+  guard remove                      关闭定时守护
+  guard status                      看守护是否在跑 + 最近日志
+  guard watch [秒]                  前台常驻巡检
+  template list                     列出可能的模板目录（平台重置 .ai-ready 的来源）
+  template apply [路径]             把模板目录本身也换成改写版，重置后即天然生效
   list                              列出探测到的 .ai-ready 目标
   status  <目标>                     对比现网与 new/
   diff    <目标>                     输出逐文件差异
@@ -738,6 +1004,9 @@ usage() {
   AIREADY_KIT_DIR      安装目录，默认 /workspace/.ai-ready-kit
   AIREADY_SKIP_UPDATE=1 跳过启动时的版本检查
   AIREADY_UPDATE_TTL   版本检查缓存秒数，默认 600
+  AIREADY_GUARD_SECS   守护巡检间隔秒数，默认 60
+  AIREADY_GUARD_QUIET=1 守护模式：只在有回写时出声
+  AIREADY_TEMPLATE     手工指定模板目录（template 命令用）
   SEARCH_ROOT          目标探测根，默认 /workspace 与 /root
 EOF
 }
@@ -801,6 +1070,9 @@ case "$CMD" in
         exit "$st" ;;
     install|update) do_install ;;
     repair)   do_repair ;;
+    reapply)  do_reapply "$@" ;;
+    guard)    cli_guard "$@" ;;
+    template) cli_template "$@" ;;
     uninstall) do_uninstall ;;
     list)     discover_targets ;;
     status)   do_status "${1:?用法: status <目标路径>}" ;;

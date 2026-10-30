@@ -208,3 +208,23 @@ CDN 的分支引用有缓存，可能几小时内一直吐旧文件。脚本对�
 
 所以即便之前缓存到了落后的 jsDelivr 地址，也不会卡在旧版本，更不会把版本往回带。
 显式设置 `AIREADY_URL_BASE` 时不做这套复核，只走你指定的源。
+
+---
+
+## 八、漂移守护（切模型后被重置）
+
+平台在「创建任务 / 重启会话 / 切换模型」时会重放 agent 资源，`~/.codingmatrix/project-tpl/.ai-ready/` 下的 rules 可能被平台写回原始版。守护做的事很简单：周期性比对目标与 `new/`，有漂移就按 `new/` 回写（回写前照例快照）。
+
+```bash
+ai-ready guard install 60     # 装 systemd timer（没有 systemd 就退回 cron），每 60s 巡检
+ai-ready guard status         # 是否在跑 + 最近 8 条日志
+ai-ready guard remove         # 关掉
+ai-ready guard once           # 手动巡检一次（安静模式，适合放 cron）
+ai-ready reapply              # 同上，带输出，切完模型手动救一次用这个
+ai-ready template list        # 列出可能的模板目录（重置来源）
+ai-ready template apply       # 把模板目录本身也换成改写版
+```
+
+日志在 `$KIT_DIR/guard.log`（超过 512KB 自动截尾）。菜单入口：`5) 维护 → 3) 漂移守护`。
+
+`template apply` 的意义：如果重置是把某个 `*project-tpl*` 目录重新铺一遍，把模板本身改掉之后，重置结果天然就是改写版，守护只剩兜底。

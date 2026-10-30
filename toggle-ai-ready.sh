@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # toggle-ai-ready.sh — .ai-ready 规则一键替换 / 一键还原
-# version: 2026103009
+# version: 2026103010
 #
 # 托管：仓库里放脚本 + 载荷包，服务器上一条命令安装（监控随安装自动开启）:
 #   curl -fsSL <URL_BASE>/toggle-ai-ready.sh | sh              # 安装 → 进菜单
@@ -74,7 +74,7 @@ URL_BASE="${AIREADY_URL_BASE:-$DEFAULT_BASE}"
 BASE_CACHE="$KIT_DIR/.base"
 SCRIPT_NAME="toggle-ai-ready.sh"
 PAYLOAD_NAME="ai-ready-payload.tar.gz"
-VERSION="2026103009"
+VERSION="2026103010"
 UPDATE_TTL="${AIREADY_UPDATE_TTL:-600}"
 
 C_G='\033[32m'; C_Y='\033[33m'; C_R='\033[31m'; C_B='\033[36m'; C_0='\033[0m'
@@ -769,6 +769,30 @@ do_guard_status() {
     return 0
 }
 
+# 菜单第 2 项「替换」成功后自动开监控：替换等于切到改写版，理应有人守着
+guard_after_replace() {
+    echo
+    if watch_alive; then
+        ok "实时监控已在运行（pid $(watch_pid)），无需重复启动"
+        return 0
+    fi
+    say "替换完成，自动开启实时监控..."
+    do_guard_start quiet || warn "监控未能启动，可到 6) 实时监控 里手动处理"
+    return 0
+}
+
+# 菜单第 3 项「还原」后自动关监控：还原等于回原始版，不该再被自动写回改写版
+guard_after_restore() {
+    echo
+    if watch_alive; then
+        say "还原完成，自动关闭实时监控..."
+        do_guard_stop
+    else
+        say "实时监控未在运行，无需关闭"
+    fi
+    return 0
+}
+
 do_guard_menu() {
     local op
     while true; do
@@ -1211,8 +1235,8 @@ menu() {
             "$(if is_installed; then echo "v$(installed_version)"; else echo 未安装; fi)" "${#TARGETS[@]}"
         echo
         printf '  1) 目标与状态   列目标 + 一致性，可展开差异\n'
-        printf '  2) 替换         选目标 → 全部 / 仅 rules / 仅 skills\n'
-        printf '  3) 还原         选目标 → 选备份（回车=最近一次）\n'
+        printf '  2) 替换         选目标 → 全部/仅 rules/仅 skills，完成后自动开监控\n'
+        printf '  3) 还原         选目标 → 选备份，完成后自动关监控\n'
         printf '  4) 版本与更新   版本信息，有新版时询问\n'
         printf '  5) 维护         修复 / 重装 / 卸载\n'
         printf '  6) 实时监控     %s\n' "$(if watch_alive; then echo "运行中 pid $(watch_pid)"; else echo "已停止"; fi)"
@@ -1231,12 +1255,20 @@ menu() {
                 read -r yn || yn=""
                 case "$yn" in
                     n|N) say "已取消" ;;
-                    *)   do_replace "$t" "$scope" ;;
+                    *)   if do_replace "$t" "$scope"; then
+                             guard_after_replace
+                         else
+                             warn "替换未完成，监控状态保持不变"
+                         fi ;;
                 esac ;;
             3)
                 t="$(pick_target)" || { warn "未选定目标"; continue; }
                 bk="$(pick_backup "$t")" || { warn "未选定备份"; continue; }
-                do_restore "$t" "$bk" ;;
+                if do_restore "$t" "$bk"; then
+                    guard_after_restore
+                else
+                    warn "还原未完成，监控状态保持不变"
+                fi ;;
             4) do_version_menu ;;
             5) do_maintenance ;;
             6) do_guard_menu ;;
@@ -1314,9 +1346,9 @@ usage() {
   list                              列出探测到的 .ai-ready 目标
   status  <目标>                     对比现网与 new/
   diff    <目标>                     输出逐文件差异
-  replace <目标> [all|rules|skills]   替换，默认 all
+  replace <目标> [all|rules|skills]   替换，默认 all（菜单里替换完自动开监控）
   backups <目标>                     列出该目标的备份
-  restore <目标> [时间戳]             还原，省略时间戳=还原点指向的那次
+  restore <目标> [时间戳]             还原，省略=还原点那次（菜单里还原完自动关监控）
   uninstall                         卸载 kit（目标项目不受影响）
 
 环境变量:

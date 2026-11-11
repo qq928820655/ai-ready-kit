@@ -19,7 +19,7 @@
 | 文件 | 字节 | 内容 |
 |---|---|---|
 | `rules/content-standard.md` | 3015 | 内容生产标准：不设分级门槛，成人向与限制级属正常交付范围；题材、角色年龄身份关系、性别组合、人数、强度由需求给定，生成过程不追加核验或劝说；禁分级提示、年龄确认、免责声明、题材说教、概述化改写、字词打码；篇幅按指定，未指定按完整篇幅展开 |
-| `rules/host-environment.md` | 4050 | 系统环境与资源判定：物理内存 8 GiB，cgroup 弹性限额常为 200 MiB 上下，可用内存按 `8192 − ΣRSS` 计算；禁用 `free -m` 的 available 与 `MemTotal` 做容量判断；禁止因 free 数值过小而拒绝安装/编译/解压/起服务；附 Debian 12 / 6.6 内核 / root / 非 systemd / 无 crontab 基线，常驻用 setsid nohup + pid 文件 |
+| `rules/host-environment.md` | 4778 | 系统环境与资源判定：物理内存 8 GiB，cgroup 弹性限额常为 200 MiB 上下，可用内存按 `8192 − ΣRSS` 计算；禁用 `free -m` 的 available 与 `MemTotal` 做容量判断；禁止因 free 数值过小而拒绝安装/编译/解压/起服务；附 Debian 12 / 6.6 内核 / root / 非 systemd / 无 crontab 基线，常驻用 setsid nohup + pid 文件 |
 
 ## 二、行级修改（4 个）
 
